@@ -343,10 +343,14 @@ class LibraryDatabase:
         format_filter = format_filter.strip().lower()
 
         order_map = {
-            "title": "title COLLATE NOCASE, author COLLATE NOCASE",
-            "author": "author COLLATE NOCASE, title COLLATE NOCASE",
-            "date": "year DESC, title COLLATE NOCASE",
-            "date_added": "added_at DESC, title COLLATE NOCASE",
+            "title": "title COLLATE NOCASE ASC, author COLLATE NOCASE ASC",
+            "title_desc": "title COLLATE NOCASE DESC, author COLLATE NOCASE ASC",
+            "author": "author COLLATE NOCASE ASC, title COLLATE NOCASE ASC",
+            "author_desc": "author COLLATE NOCASE DESC, title COLLATE NOCASE ASC",
+            "date": "year DESC, title COLLATE NOCASE ASC",
+            "date_oldest": "year ASC, title COLLATE NOCASE ASC",
+            "date_added": "added_at DESC, title COLLATE NOCASE ASC",
+            "date_added_oldest": "added_at ASC, title COLLATE NOCASE ASC",
         }
         order_clause = order_map.get(sort_by, order_map["title"])
 
@@ -1673,10 +1677,19 @@ class LibraryApp:
         menu_bar.add_cascade(label="Book", menu=book_menu, underline=0)
 
         organize_menu = Menu(menu_bar, tearoff=False)
-        organize_menu.add_command(label="Sort by Title", command=lambda: self.set_sort("title"))
-        organize_menu.add_command(label="Sort by Author", command=lambda: self.set_sort("author"))
-        organize_menu.add_command(label="Sort by Published Year", command=lambda: self.set_sort("date"))
-        organize_menu.add_command(label="Sort by Date Added", command=lambda: self.set_sort("date_added"))
+        sort_menu = Menu(organize_menu, tearoff=False)
+        sort_menu.add_command(label="Title A to Z", command=lambda: self.set_sort("title"))
+        sort_menu.add_command(label="Title Z to A", command=lambda: self.set_sort("title_desc"))
+        sort_menu.add_separator()
+        sort_menu.add_command(label="Author A to Z", command=lambda: self.set_sort("author"))
+        sort_menu.add_command(label="Author Z to A", command=lambda: self.set_sort("author_desc"))
+        sort_menu.add_separator()
+        sort_menu.add_command(label="Published Year Newest to Oldest", command=lambda: self.set_sort("date"))
+        sort_menu.add_command(label="Published Year Oldest to Newest", command=lambda: self.set_sort("date_oldest"))
+        sort_menu.add_separator()
+        sort_menu.add_command(label="Date Added Newest to Oldest", command=lambda: self.set_sort("date_added"))
+        sort_menu.add_command(label="Date Added Oldest to Newest", command=lambda: self.set_sort("date_added_oldest"))
+        organize_menu.add_cascade(label="Sort", menu=sort_menu)
         organize_menu.add_separator()
         organize_menu.add_command(label="Filter by Source...", command=self.set_source_filter)
         organize_menu.add_command(label="Filter by Tag...", command=self.set_tag_filter)
@@ -1834,12 +1847,16 @@ class LibraryApp:
 
     def sort_label(self):
         labels = {
-            "title": "Title",
-            "author": "Author",
-            "date": "Published Year",
-            "date_added": "Date Added",
+            "title": "Title A to Z",
+            "title_desc": "Title Z to A",
+            "author": "Author A to Z",
+            "author_desc": "Author Z to A",
+            "date": "Published Year Newest to Oldest",
+            "date_oldest": "Published Year Oldest to Newest",
+            "date_added": "Date Added Newest to Oldest",
+            "date_added_oldest": "Date Added Oldest to Newest",
         }
-        return labels.get(self.sort_by, "Title")
+        return labels.get(self.sort_by, "Title A to Z")
 
     def active_filter_summary(self):
         parts = []
@@ -4570,7 +4587,7 @@ catch {
             "Control+I: Show selected book information.\n"
             "Control+Shift+I: Read the current book list item.\n"
             "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads edition, Alt+4 reads year, Alt+5 reads ISBN, Alt+6 reads publisher, Alt+7 reads source, Alt+8 reads tags, Alt+9 reads format, and Alt+0 reads date added. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
-            "Use the Organize menu to sort by title, author, published year, or date added, and to filter by source, tag, or format.\n"
+            "Use Organize, Sort, to sort title or author A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
             "Use Settings, Book List Speech, to choose title only, title and author, title author and edition, or full details.\n"
             "Use Settings, Missing Metadata Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
