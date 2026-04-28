@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Moved filter commands into an Organize, Filter submenu and removed the older Read Current Book command.
 - Expanded the Organize, Sort menu with title A to Z, title Z to A, author A to Z, author Z to A, published year newest or oldest first, and date added newest or oldest first.
 - Removed the NVDA announcement setting. NVDA book list announcements now turn on automatically when NVDA is detected and running.
 - Added library database backup and restore through a user-chosen synced cloud folder, including Google Drive, OneDrive, iCloud Drive, another folder, daily, weekly, monthly, and on-demand schedules.

@@ -1670,7 +1670,6 @@ class LibraryApp:
         book_menu.add_command(label="View Cover Image...", command=self.view_selected_cover_image)
         book_menu.add_command(label="Convert to EPUB...\tCtrl+R", command=self.convert_selected_to_epub)
         book_menu.add_command(label="Show Selected Book Information\tCtrl+I", command=self.show_selected_book_info)
-        book_menu.add_command(label="Read Current Book\tCtrl+Shift+I", command=self.read_current_book)
         book_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
         book_menu.add_command(label="Deselect All Books\tCtrl+Shift+A", command=self.deselect_all_books)
         book_menu.add_command(label="Delete from Library\tDelete", command=self.delete_book)
@@ -1691,10 +1690,12 @@ class LibraryApp:
         sort_menu.add_command(label="Date Added Oldest to Newest", command=lambda: self.set_sort("date_added_oldest"))
         organize_menu.add_cascade(label="Sort", menu=sort_menu)
         organize_menu.add_separator()
-        organize_menu.add_command(label="Filter by Source...", command=self.set_source_filter)
-        organize_menu.add_command(label="Filter by Tag...", command=self.set_tag_filter)
-        organize_menu.add_command(label="Filter by Format...", command=self.set_format_filter)
-        organize_menu.add_command(label="Clear Filters", command=self.clear_filters)
+        filter_menu = Menu(organize_menu, tearoff=False)
+        filter_menu.add_command(label="By Source...", command=self.set_source_filter)
+        filter_menu.add_command(label="By Tag...", command=self.set_tag_filter)
+        filter_menu.add_command(label="By Format...", command=self.set_format_filter)
+        filter_menu.add_command(label="Clear Filters", command=self.clear_filters)
+        organize_menu.add_cascade(label="Filter", menu=filter_menu)
         organize_menu.add_separator()
         organize_menu.add_command(label="Remove Duplicates, Prefer EPUB...", command=self.remove_duplicates_prefer_epub)
         organize_menu.add_command(label="Show Current Organize Settings", command=self.show_organize_settings)
@@ -1800,7 +1801,6 @@ class LibraryApp:
         self.book_list.bind("<Control-n>", lambda event: self.add_book())
         self.book_list.bind("<Control-f>", self.focus_search_from_keyboard)
         self.book_list.bind("<Control-i>", lambda event: self.show_selected_book_info())
-        self.book_list.bind("<Control-I>", lambda event: self.read_current_book())
         self.book_list.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
         self.book_list.bind("<Control-A>", lambda event: self.deselect_all_books())
         self.book_list.bind("<Control-space>", self.toggle_mark_current_book)
@@ -1820,7 +1820,6 @@ class LibraryApp:
         self.root.bind("<Control-E>", lambda event: self.send_to_nls_ereader())
         self.root.bind("<Control-f>", self.focus_search_from_keyboard)
         self.root.bind("<Control-i>", lambda event: self.show_selected_book_info())
-        self.root.bind("<Control-I>", lambda event: self.read_current_book())
         self.root.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
         self.root.bind("<Control-l>", lambda event: self.focus_books_list())
         self.root.bind("<Control-A>", lambda event: self.deselect_all_books())
@@ -2858,14 +2857,6 @@ class LibraryApp:
         if index is None or index >= self.book_list.size():
             return ""
         return self.book_list.get(index)
-
-    def read_current_book(self):
-        text = self.current_book_list_text()
-        if not text:
-            messagebox.showinfo("No books", "There are no books in the current list.")
-            return
-        self.status_var.set(text)
-        messagebox.showinfo("Current book", text)
 
     def show_selected_book_info(self):
         if self.book_list.size() == 0:
@@ -4585,9 +4576,9 @@ catch {
             "Control+F: Search metadata.\n"
             "Escape: Clear the current search and return to the full book list.\n"
             "Control+I: Show selected book information.\n"
-            "Control+Shift+I: Read the current book list item.\n"
             "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads edition, Alt+4 reads year, Alt+5 reads ISBN, Alt+6 reads publisher, Alt+7 reads source, Alt+8 reads tags, Alt+9 reads format, and Alt+0 reads date added. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
             "Use Organize, Sort, to sort title or author A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
+            "Use Organize, Filter, to filter by source, tag, or format, or to clear filters.\n"
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
             "Use Settings, Book List Speech, to choose title only, title and author, title author and edition, or full details.\n"
             "Use Settings, Missing Metadata Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
