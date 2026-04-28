@@ -1652,7 +1652,7 @@ class LibraryApp:
         file_menu.add_command(label="Open Book\tCtrl+O", command=self.open_book)
         file_menu.add_command(label="Add Book...\tCtrl+N", command=self.add_book)
         file_menu.add_command(label="Import Folder...\tCtrl+Shift+N", command=self.import_folder)
-        file_menu.add_command(label="Export Copy...\tCtrl+E", command=self.export_book)
+        file_menu.add_command(label="Export Book Copy...\tCtrl+E", command=self.export_book)
         send_to_menu = Menu(file_menu, tearoff=False)
         send_to_menu.add_command(label="Voice Dream...\tCtrl+Shift+V", command=self.send_to_voice_dream)
         send_to_menu.add_command(label="Kindle...\tCtrl+Shift+K", command=self.send_to_kindle)
@@ -1666,10 +1666,10 @@ class LibraryApp:
         book_menu = Menu(menu_bar, tearoff=False)
         book_menu.add_command(label="Edit Metadata...\tF2", command=self.edit_book)
         book_menu.add_command(label="Auto-Detect Metadata...\tCtrl+D", command=self.auto_detect_selected_metadata)
-        book_menu.add_command(label="Look Up Book Metadata from Internet...", command=self.lookup_selected_metadata_online)
+        book_menu.add_command(label="Look Up Metadata Online...", command=self.lookup_selected_metadata_online)
         book_menu.add_command(label="View Cover Image...", command=self.view_selected_cover_image)
         book_menu.add_command(label="Convert to EPUB...\tCtrl+R", command=self.convert_selected_to_epub)
-        book_menu.add_command(label="Show Selected Book Information\tCtrl+I", command=self.show_selected_book_info)
+        book_menu.add_command(label="Show Book Details\tCtrl+I", command=self.show_selected_book_info)
         book_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
         book_menu.add_command(label="Deselect All Books\tCtrl+Shift+A", command=self.deselect_all_books)
         book_menu.add_command(label="Delete from Library\tDelete", command=self.delete_book)
@@ -1697,13 +1697,13 @@ class LibraryApp:
         filter_menu.add_command(label="Clear Filters", command=self.clear_filters)
         organize_menu.add_cascade(label="Filter", menu=filter_menu)
         organize_menu.add_separator()
-        organize_menu.add_command(label="Remove Duplicates, Prefer EPUB...", command=self.remove_duplicates_prefer_epub)
-        organize_menu.add_command(label="Show Current Organize Settings", command=self.show_organize_settings)
+        organize_menu.add_command(label="Remove Duplicate Books, Prefer EPUB...", command=self.remove_duplicates_prefer_epub)
+        organize_menu.add_command(label="Show Sort and Filter Settings", command=self.show_organize_settings)
         menu_bar.add_cascade(label="Organize", menu=organize_menu, underline=0)
 
         search_menu = Menu(menu_bar, tearoff=False)
-        search_menu.add_command(label="Search Metadata...\tCtrl+F", command=self.focus_search)
-        search_menu.add_command(label="Move to Books List\tCtrl+L", command=self.focus_books_list)
+        search_menu.add_command(label="Search Library Metadata...\tCtrl+F", command=self.focus_search)
+        search_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
         search_menu.add_command(label="Clear Search", command=self.clear_search)
         search_menu.add_command(label="Explain Search", command=self.explain_search)
         menu_bar.add_cascade(label="Search", menu=search_menu, underline=0)
@@ -1713,9 +1713,9 @@ class LibraryApp:
         speech_menu.add_command(label="Title Only", command=lambda: self.set_book_list_speech_fields(["title"]))
         speech_menu.add_command(label="Title and Author", command=lambda: self.set_book_list_speech_fields(["title", "author"]))
         speech_menu.add_command(label="Title, Author, and Edition", command=lambda: self.set_book_list_speech_fields(["title", "author", "edition"]))
-        speech_menu.add_command(label="Full Details", command=lambda: self.set_book_list_speech_fields([key for key, _label in BOOK_LIST_SPEECH_FIELDS]))
-        speech_menu.add_command(label="Show Current Speech Details", command=self.show_book_list_speech_fields)
-        settings_menu.add_cascade(label="Book List Speech", menu=speech_menu)
+        speech_menu.add_command(label="All Details", command=lambda: self.set_book_list_speech_fields([key for key, _label in BOOK_LIST_SPEECH_FIELDS]))
+        speech_menu.add_command(label="Show Current Book List Reading", command=self.show_book_list_speech_fields)
+        settings_menu.add_cascade(label="Book List Reading", menu=speech_menu)
         settings_menu.add_separator()
         missing_metadata_menu = Menu(settings_menu, tearoff=False)
         missing_metadata_menu.add_command(label="Off", command=lambda: self.set_missing_metadata_sound_mode("off"))
@@ -1725,13 +1725,13 @@ class LibraryApp:
         missing_metadata_menu.add_separator()
         missing_metadata_menu.add_command(label="Show Current Setting", command=self.show_missing_metadata_sound_mode)
         missing_metadata_menu.add_command(label="Test Sound", command=self.test_missing_metadata_sound)
-        settings_menu.add_cascade(label="Missing Metadata Sound", menu=missing_metadata_menu)
+        settings_menu.add_cascade(label="Missing Metadata Alert Sound", menu=missing_metadata_menu)
         settings_menu.add_separator()
         backup_menu = Menu(settings_menu, tearoff=False)
         backup_menu.add_command(label="Use OneDrive Folder...", command=lambda: self.choose_cloud_backup_folder("onedrive"))
         backup_menu.add_command(label="Use Google Drive Folder...", command=lambda: self.choose_cloud_backup_folder("google_drive"))
         backup_menu.add_command(label="Use iCloud Drive Folder...", command=lambda: self.choose_cloud_backup_folder("icloud"))
-        backup_menu.add_command(label="Choose Other Backup Folder...", command=lambda: self.choose_cloud_backup_folder("other"))
+        backup_menu.add_command(label="Choose Another Backup Folder...", command=lambda: self.choose_cloud_backup_folder("other"))
         backup_menu.add_separator()
         schedule_menu = Menu(backup_menu, tearoff=False)
         schedule_menu.add_command(label="On Demand", command=lambda: self.set_backup_schedule("on_demand"))
@@ -1766,7 +1766,7 @@ class LibraryApp:
         search_frame = ttk.Frame(main)
         search_frame.pack(fill=X, pady=(0, 8))
 
-        ttk.Label(search_frame, text="Search metadata").pack(side=LEFT, padx=(0, 8))
+        ttk.Label(search_frame, text="Search library metadata").pack(side=LEFT, padx=(0, 8))
         self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
         self.search_entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
         self.search_entry.bind("<Return>", lambda event: self.search_and_focus())
@@ -1879,7 +1879,7 @@ class LibraryApp:
         value = AccessibleSingleFieldDialog.ask(
             self.root,
             "Source Filter",
-            "Enter source text to filter by, such as Bookshare, Kindle, Personal, or leave blank to clear source filter.",
+            "Enter source text to filter by, such as Bookshare, Kindle, or Personal. Leave blank to clear the source filter.",
             self.filter_source,
         )
         if value is None:
@@ -1893,7 +1893,7 @@ class LibraryApp:
         value = AccessibleSingleFieldDialog.ask(
             self.root,
             "Tag Filter",
-            "Enter tag text to filter by, such as textbook, fiction, unread, or leave blank to clear tag filter.",
+            "Enter tag text to filter by, such as textbook, fiction, or unread. Leave blank to clear the tag filter.",
             self.filter_tag,
         )
         if value is None:
@@ -1907,7 +1907,7 @@ class LibraryApp:
         value = AccessibleSingleFieldDialog.ask(
             self.root,
             "Format Filter",
-            "Enter format text to filter by, such as epub, pdf, docx, or leave blank to clear format filter.",
+            "Enter format text to filter by, such as epub, pdf, or docx. Leave blank to clear the format filter.",
             self.filter_format,
         )
         if value is None:
@@ -1927,7 +1927,7 @@ class LibraryApp:
 
     def show_organize_settings(self):
         messagebox.showinfo(
-            "Current Organize Settings",
+            "Current Sort and Filter Settings",
             f"Sort: {self.sort_label()}\n"
             f"Filters: {self.active_filter_summary()}\n"
             f"Books shown: {self.book_list.size()}"
@@ -2064,11 +2064,11 @@ class LibraryApp:
                 current_book_id = self.book_list_ids[index]
         self.refresh_books(selected_book_id=current_book_id)
         self.focus_books_list()
-        self.status_var.set(f"Book list speech details saved: {self.book_list_speech_summary()}.")
+        self.status_var.set(f"Book list reading saved: {self.book_list_speech_summary()}.")
 
     def show_book_list_speech_fields(self):
         messagebox.showinfo(
-            "Current Book List Speech Details",
+            "Current Book List Reading",
             f"The book list currently reads:\n\n{self.book_list_speech_summary()}"
         )
 
@@ -2097,14 +2097,14 @@ class LibraryApp:
         self.db.set_setting("missing_metadata_sound", "0" if mode == "off" else "1")
         self.last_missing_metadata_sound_book_id = None
         label = self.missing_metadata_sound_mode_label()
-        self.status_var.set(f"Missing metadata sound set to {label}.")
-        messagebox.showinfo("Missing Metadata Sound", f"Missing metadata sound is now set to:\n\n{label}")
+        self.status_var.set(f"Missing metadata alert sound set to {label}.")
+        messagebox.showinfo("Missing Metadata Alert Sound", f"Missing metadata alert sound is now set to:\n\n{label}")
         if mode != "off":
             self.play_missing_metadata_sound()
 
     def show_missing_metadata_sound_mode(self):
         messagebox.showinfo(
-            "Missing Metadata Sound",
+            "Missing Metadata Alert Sound",
             f"Current setting:\n\n{self.missing_metadata_sound_mode_label()}"
         )
 
@@ -2112,13 +2112,13 @@ class LibraryApp:
         enabled = not self.missing_metadata_sound_enabled()
         self.set_missing_metadata_sound_mode(DEFAULT_MISSING_METADATA_SOUND_MODE if enabled else "off")
         state = "on" if enabled else "off"
-        self.status_var.set(f"Missing metadata sound turned {state}.")
+        self.status_var.set(f"Missing metadata alert sound turned {state}.")
 
     def test_missing_metadata_sound(self):
         self.play_missing_metadata_sound()
         messagebox.showinfo(
-            "Missing Metadata Sound",
-            "If your Windows system sounds are enabled, you should have heard the missing metadata sound."
+            "Missing Metadata Alert Sound",
+            "If your Windows system sounds are enabled, you should have heard the missing metadata alert sound."
         )
 
     def book_has_missing_metadata(self, book_id):
@@ -2469,7 +2469,7 @@ class LibraryApp:
             if automatic:
                 return
             messagebox.showinfo(
-                "Choose backup folder",
+                "Choose a backup folder",
                 "Choose a Google Drive, OneDrive, iCloud Drive, or other synced folder before backing up."
             )
             self.choose_cloud_backup_folder("other")
@@ -2519,16 +2519,16 @@ class LibraryApp:
     def restore_library_backup(self):
         folder, backup_file, _manifest_file = self.backup_paths()
         if not folder:
-            messagebox.showinfo("No backup folder", "Choose a backup folder before restoring.")
+            messagebox.showinfo("Choose a backup folder", "Choose a backup folder before restoring.")
             self.choose_cloud_backup_folder("other")
             folder, backup_file, _manifest_file = self.backup_paths()
             if not folder:
                 return
         if not backup_file.exists():
-            messagebox.showerror("No backup found", f"No library backup was found here:\n\n{backup_file}")
+            messagebox.showerror("Backup not found", f"No library backup was found here:\n\n{backup_file}")
             return
         if not self.backup_file_is_valid(backup_file):
-            messagebox.showerror("Backup not valid", "The backup file does not look like an Accessible Ebook Library Manager database.")
+            messagebox.showerror("Backup file not valid", "The backup file does not look like an Accessible Ebook Library Manager database.")
             return
 
         if not messagebox.askyesno(
@@ -2578,10 +2578,10 @@ class LibraryApp:
     def focus_search(self):
         value = AccessibleSingleFieldDialog.ask(
             self.root,
-            "Search Metadata",
+            "Search Library Metadata",
             "Enter text to search in title, author, source, tags, format, notes, edition, year, ISBN, and publisher. Leave blank to show all books.",
             self.search_var.get(),
-            heading="Search Metadata",
+            heading="Search Library Metadata",
         )
         if value is None:
             self.focus_books_list()
@@ -2709,7 +2709,7 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return "break"
 
         field_key, _default_label = BOOK_LIST_SPEECH_FIELDS[field_index]
@@ -2763,7 +2763,7 @@ class LibraryApp:
 
     def explain_search(self):
         messagebox.showinfo(
-            "Search metadata",
+            "Search Library Metadata",
             "Search looks through library metadata only: title, author, source, tags, format, notes, edition, year, ISBN, and publisher.\n\n"
             "It does not search inside the full text of every book yet."
         )
@@ -3371,12 +3371,12 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         stored_path = Path(row[8])
         if not stored_path.exists():
-            messagebox.showerror("File missing", "The stored book file could not be found.")
+            messagebox.showerror("Book file missing", "The stored book file could not be found.")
             return
 
         existing = self.row_to_metadata(row)
@@ -3414,7 +3414,7 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         existing = self.row_to_metadata(row)
@@ -3478,7 +3478,7 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         cover_url = row[14] if len(row) > 14 else ""
@@ -3514,7 +3514,7 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         try:
@@ -3594,13 +3594,13 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found in the library database.")
+            messagebox.showerror("Book not found", "The selected book was not found in the library database.")
             return
 
         path = str(row[8])
         if not os.path.exists(path):
             messagebox.showerror(
-                "File missing",
+                "Book file missing",
                 "The stored book file could not be found. It may have been moved or deleted.\n\n"
                 f"Stored path: {path}"
             )
@@ -3638,7 +3638,7 @@ class LibraryApp:
                     self.status_var.set("Opened Kindle for PC.")
                     return
                 except Exception as exc:
-                    messagebox.showerror("Open Kindle failed", str(exc))
+                    messagebox.showerror("Open Kindle failed", f"Could not open Kindle for PC.\n\n{exc}")
                     return
 
         try:
@@ -3677,12 +3677,12 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         source_file = Path(row[8])
         if not source_file.exists():
-            messagebox.showerror("File missing", "The stored book file could not be found.")
+            messagebox.showerror("Book file missing", "The stored book file could not be found.")
             return
 
         if source_file.suffix.lower() == ".epub":
@@ -3716,7 +3716,7 @@ class LibraryApp:
             self.status_var.set("Conversion timed out.")
             return
         except Exception as exc:
-            messagebox.showerror("Conversion failed", str(exc))
+            messagebox.showerror("Conversion failed", f"Could not convert this book to EPUB.\n\n{exc}")
             self.status_var.set("Conversion failed.")
             return
 
@@ -3825,7 +3825,7 @@ class LibraryApp:
             else:
                 missing.append(row[1])
         if not rows:
-            messagebox.showerror("File missing", "The stored book file could not be found.")
+            messagebox.showerror("Book file missing", "The stored book file could not be found.")
             return
 
         emails = self.parse_kindle_emails(self.db.get_setting("kindle_email", ""))
@@ -3864,7 +3864,7 @@ class LibraryApp:
                 + "\n".join(str(source) for _row, source in rows)
             )
         except Exception as exc:
-            messagebox.showerror("Send to Kindle failed", str(exc))
+            messagebox.showerror("Send to Kindle failed", f"Could not send this book to Kindle.\n\n{exc}")
 
     def choose_default_reader(self):
         path = filedialog.askopenfilename(
@@ -3890,7 +3890,7 @@ class LibraryApp:
             else:
                 subprocess.Popen(["xdg-open", folder])
         except Exception as exc:
-            messagebox.showerror("Open library folder failed", str(exc))
+            messagebox.showerror("Open library folder failed", f"Could not open the library folder.\n\n{exc}")
 
     def removable_windows_drives(self):
         if not sys.platform.startswith("win"):
@@ -4023,7 +4023,7 @@ class LibraryApp:
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         source = Path(row[8])
@@ -4332,7 +4332,7 @@ catch {
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         source = Path(row[8])
@@ -4428,13 +4428,13 @@ catch {
 
         row = self.db.get_book(book_id)
         if not row:
-            messagebox.showerror("Not found", "The selected book was not found.")
+            messagebox.showerror("Book not found", "The selected book was not found.")
             return
 
         source = Path(row[8])
         if not source.exists():
             messagebox.showerror(
-                "File missing",
+                "Book file missing",
                 "The stored book file could not be found, so it cannot be sent to Voice Dream."
             )
             return
@@ -4573,15 +4573,15 @@ catch {
             "Control+Shift+A: Deselect all books selected for batch actions.\n"
             "Control+K: Open Kindle for PC.\n"
             "Delete: Remove selected book from library.\n"
-            "Control+F: Search metadata.\n"
+            "Control+F: Search library metadata.\n"
             "Escape: Clear the current search and return to the full book list.\n"
-            "Control+I: Show selected book information.\n"
+            "Control+I: Show book details.\n"
             "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads edition, Alt+4 reads year, Alt+5 reads ISBN, Alt+6 reads publisher, Alt+7 reads source, Alt+8 reads tags, Alt+9 reads format, and Alt+0 reads date added. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
             "Use Organize, Sort, to sort title or author A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
             "Use Organize, Filter, to filter by source, tag, or format, or to clear filters.\n"
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
-            "Use Settings, Book List Speech, to choose title only, title and author, title author and edition, or full details.\n"
-            "Use Settings, Missing Metadata Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
+            "Use Settings, Book List Reading, to choose title only, title and author, title author and edition, or all details.\n"
+            "Use Settings, Missing Metadata Alert Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
             "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local database is lost.\n"
             "If NVDA is running and its controller is available, the app automatically uses NVDA book list announcements. No setting is needed.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
