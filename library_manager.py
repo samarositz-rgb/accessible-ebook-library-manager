@@ -79,6 +79,7 @@ BOOK_LIST_SPEECH_FIELDS = [
     ("added_at", "Date added"),
 ]
 DEFAULT_BOOK_LIST_SPEECH_FIELDS = ["title", "author"]
+NO_EDITION_VALUE = "No edition"
 BACKUP_SCHEDULES = {
     "on_demand": ("On Demand", None),
     "daily": ("Daily", timedelta(days=1)),
@@ -1353,13 +1354,26 @@ $saveButton = New-Object System.Windows.Forms.Button
 $saveButton.Text = "&Save"
 $saveButton.Width = 90
 $saveButton.TabIndex = $tabIndex
+$noEditionButton = New-Object System.Windows.Forms.Button
+$noEditionButton.Text = "No &Edition"
+$noEditionButton.Width = 110
+$noEditionButton.TabIndex = $tabIndex + 1
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "Cancel"
 $cancelButton.Width = 90
-$cancelButton.TabIndex = $tabIndex + 1
+$cancelButton.TabIndex = $tabIndex + 2
 
 $buttonPanel.Controls.Add($cancelButton)
+$buttonPanel.Controls.Add($noEditionButton)
 $buttonPanel.Controls.Add($saveButton)
+
+$noEditionButton.Add_Click({
+    if ($textBoxes.ContainsKey("edition")) {
+        $textBoxes["edition"].Text = "No edition"
+        $textBoxes["edition"].Focus() | Out-Null
+        $textBoxes["edition"].SelectAll()
+    }
+})
 
 $saveButton.Add_Click({
     $titleBox = $textBoxes["title"]
@@ -1448,7 +1462,7 @@ class AccessibleMetadataFormDialog:
     FIELDS = [
         ("title", "Title", "Required."),
         ("author", "Author", ""),
-        ("edition", "Edition", "For example third edition or revised edition."),
+        ("edition", "Edition", "For example third edition, revised edition, or No edition."),
         ("year", "Year", "Publication year."),
         ("isbn", "ISBN", ""),
         ("publisher", "Publisher", ""),
@@ -1494,6 +1508,7 @@ class AccessibleMetadataFormDialog:
         ttk.Button(button_frame, text="Previous", command=self.previous_field).pack(side=LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="Read Current Value", command=self.read_current_value).pack(side=LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="Edit Current Value", command=self.focus_entry).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(button_frame, text="Mark No Edition", command=self.mark_no_edition).pack(side=LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="Next", command=self.next_field).pack(side=LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="Save", command=self.save).pack(side=LEFT, padx=(0, 8))
         ttk.Button(button_frame, text="Cancel", command=self.cancel).pack(side=LEFT)
@@ -1556,6 +1571,15 @@ class AccessibleMetadataFormDialog:
             value = "blank"
         messagebox.showinfo(f"{label} current value", f"{label}: {value}")
         self.window.after(50, self.focus_entry)
+        return "break"
+
+    def mark_no_edition(self):
+        self.store_current_field()
+        edition_index = self.field_index("edition")
+        self.values["edition"] = NO_EDITION_VALUE
+        self.load_field(edition_index)
+        if self.parent_app:
+            self.parent_app.status_var.set("Edition marked as No edition.")
         return "break"
 
     def next_field(self):

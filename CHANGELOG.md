@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Added a No edition marker in the metadata editor so books without an edition statement can be identified clearly.
 - Polished menu labels and common error messages for tester-facing builds.
 - Moved filter commands into an Organize, Filter submenu and removed the older Read Current Book command.
 - Expanded the Organize, Sort menu with title A to Z, title Z to A, author A to Z, author Z to A, published year newest or oldest first, and date added newest or oldest first.
