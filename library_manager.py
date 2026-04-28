@@ -1703,12 +1703,6 @@ class LibraryApp:
         speech_menu.add_command(label="Show Current Speech Details", command=self.show_book_list_speech_fields)
         settings_menu.add_cascade(label="Book List Speech", menu=speech_menu)
         settings_menu.add_separator()
-        screen_reader_menu = Menu(settings_menu, tearoff=False)
-        screen_reader_menu.add_command(label="NVDA Book List Announcements On", command=lambda: self.set_nvda_book_list_announcements(True))
-        screen_reader_menu.add_command(label="NVDA Book List Announcements Off", command=lambda: self.set_nvda_book_list_announcements(False))
-        screen_reader_menu.add_command(label="Show Screen Reader Support Settings", command=self.show_screen_reader_support_settings)
-        settings_menu.add_cascade(label="Screen Reader Support", menu=screen_reader_menu)
-        settings_menu.add_separator()
         missing_metadata_menu = Menu(settings_menu, tearoff=False)
         missing_metadata_menu.add_command(label="Off", command=lambda: self.set_missing_metadata_sound_mode("off"))
         missing_metadata_menu.add_command(label="Missing Author Only", command=lambda: self.set_missing_metadata_sound_mode("author"))
@@ -2152,27 +2146,13 @@ class LibraryApp:
                     pass
 
     def nvda_book_list_announcements_enabled(self):
-        return self.db.get_setting("nvda_book_list_announcements", "1") == "1"
-
-    def set_nvda_book_list_announcements(self, enabled):
-        self.db.set_setting("nvda_book_list_announcements", "1" if enabled else "0")
-        state = "on" if enabled else "off"
-        self.status_var.set(f"NVDA book list announcements turned {state}.")
-        messagebox.showinfo("NVDA Book List Announcements", f"NVDA book list announcements are now {state}.")
-
-    def toggle_nvda_book_list_announcements(self):
-        enabled = not self.nvda_book_list_announcements_enabled()
-        self.set_nvda_book_list_announcements(enabled)
-
-    def show_screen_reader_support_settings(self):
-        nvda_state = "On" if self.nvda_book_list_announcements_enabled() else "Off"
-        messagebox.showinfo(
-            "Screen Reader Support Settings",
-            "Screen reader support settings:\n\n"
-            f"NVDA book list announcements: {nvda_state}\n\n"
-            "Book List Speech controls which fields are exposed while moving through the book list. "
-            "Alt+number readouts use normal focus changes so screen readers such as JAWS can read the requested field."
-        )
+        controller = self.get_nvda_controller()
+        if not controller:
+            return False
+        try:
+            return controller.nvdaController_testIfRunning() == 0
+        except Exception:
+            return False
 
     def get_nvda_controller(self):
         if self.nvda_controller_checked:
@@ -4595,7 +4575,7 @@ catch {
             "Use Settings, Book List Speech, to choose title only, title and author, title author and edition, or full details.\n"
             "Use Settings, Missing Metadata Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
             "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local database is lost.\n"
-            "Use Settings, Screen Reader Support, to turn NVDA book list announcements on or off and review screen reader support settings.\n"
+            "If NVDA is running and its controller is available, the app automatically uses NVDA book list announcements. No setting is needed.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
             "Use File, Send To, NLS eReader, to copy the selected book to a connected NLS eReader. If the app cannot detect it, you can choose the eReader folder manually.\n"
             "Use File, Send To, HumanWare Braille eReader MTP, when Windows shows the device under This PC but File Explorer does not give it a pasteable folder path.\n"
