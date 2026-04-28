@@ -2140,11 +2140,41 @@ class LibraryApp:
             return
         self.status_var.set(text)
         controller = self.get_nvda_controller()
-        if not controller:
+        spoke = False
+        try:
+            if controller and controller.nvdaController_testIfRunning() == 0:
+                controller.nvdaController_speakText(text)
+                spoke = True
+        except Exception:
+            pass
+        if not spoke:
+            self.speak_text_with_windows_voice(text)
+
+    def speak_text_with_windows_voice(self, text):
+        if not sys.platform.startswith("win") or not shutil.which("powershell"):
             return
         try:
-            if controller.nvdaController_testIfRunning() == 0:
-                controller.nvdaController_speakText(text)
+            process = subprocess.Popen(
+                [
+                    "powershell",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "$text = [Console]::In.ReadToEnd(); "
+                        "$voice = New-Object -ComObject SAPI.SpVoice; "
+                        "$voice.Speak($text) | Out-Null"
+                    ),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                creationflags=WINDOWS_NO_CONSOLE_FLAGS,
+            )
+            process.stdin.write(text)
+            process.stdin.close()
         except Exception:
             pass
 

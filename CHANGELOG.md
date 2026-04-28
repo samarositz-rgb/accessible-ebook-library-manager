@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Fixed Alt+number single-press reading so it can speak the requested field even when that field is not included in the current Book List Speech setting.
 - Added Alt+number shortcuts in the books list:
   - Alt+1 reads the title.
   - Alt+2 reads the author.
