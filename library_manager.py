@@ -1581,6 +1581,7 @@ class LibraryApp:
 
         self.search_var = StringVar()
         self.status_var = StringVar(value="Ready")
+        self.shortcut_readout_var = StringVar()
         self.book_list_ids = []
         self.book_list_titles = []
         self.marked_book_ids = set()
@@ -1590,6 +1591,7 @@ class LibraryApp:
         self.last_nvda_announcement = ""
         self.last_alt_number_key = ""
         self.last_alt_number_time = 0.0
+        self.shortcut_readout_return_after = None
         self.sort_by = "title"
         self.filter_source = ""
         self.filter_tag = ""
@@ -1733,8 +1735,7 @@ class LibraryApp:
         self.book_list.bind("<Control-A>", lambda event: self.deselect_all_books())
         self.book_list.bind("<Control-space>", self.toggle_mark_current_book)
         self.book_list.bind("<Escape>", self.clear_search_from_keyboard)
-        for digit in "1234567890":
-            self.book_list.bind(f"<Alt-KeyPress-{digit}>", self.on_book_list_alt_number)
+        self.bind_alt_number_shortcuts(self.book_list)
         self.book_list.bind("<<ListboxSelect>>", self.on_book_list_select)
         self.book_list.bind("<KeyPress>", self.on_book_list_keypress)
 
@@ -1756,10 +1757,23 @@ class LibraryApp:
         self.root.bind("<Escape>", self.clear_search_from_keyboard)
         self.root.bind("<F1>", lambda event: self.show_help())
 
+        self.shortcut_readout = tk.Entry(
+            main,
+            textvariable=self.shortcut_readout_var,
+            state="readonly",
+            takefocus=1,
+        )
+        self.shortcut_readout.pack(fill=X, pady=(8, 0))
+        self.bind_alt_number_shortcuts(self.shortcut_readout)
+
         status = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status.pack(fill=X, pady=(8, 0))
 
         self.book_list.focus_set()
+
+    def bind_alt_number_shortcuts(self, widget):
+        for digit in "1234567890":
+            widget.bind(f"<Alt-KeyPress-{digit}>", self.on_book_list_alt_number)
 
     def sort_label(self):
         labels = {
@@ -2139,42 +2153,26 @@ class LibraryApp:
         if not text:
             return
         self.status_var.set(text)
-        controller = self.get_nvda_controller()
-        spoke = False
         try:
-            if controller and controller.nvdaController_testIfRunning() == 0:
-                controller.nvdaController_speakText(text)
-                spoke = True
+            selected_index = self.current_book_index()
+            self.shortcut_readout_var.set(text)
+            self.shortcut_readout.focus_force()
+            self.shortcut_readout.selection_range(0, END)
+            self.shortcut_readout.icursor(END)
+            if self.shortcut_readout_return_after is not None:
+                self.root.after_cancel(self.shortcut_readout_return_after)
+            self.shortcut_readout_return_after = self.root.after(
+                1600,
+                lambda index=selected_index: self.return_focus_from_shortcut_readout(index),
+            )
         except Exception:
             pass
-        if not spoke:
-            self.speak_text_with_windows_voice(text)
 
-    def speak_text_with_windows_voice(self, text):
-        if not sys.platform.startswith("win") or not shutil.which("powershell"):
-            return
+    def return_focus_from_shortcut_readout(self, selected_index=None):
+        self.shortcut_readout_return_after = None
         try:
-            process = subprocess.Popen(
-                [
-                    "powershell",
-                    "-WindowStyle",
-                    "Hidden",
-                    "-NoProfile",
-                    "-Command",
-                    (
-                        "$text = [Console]::In.ReadToEnd(); "
-                        "$voice = New-Object -ComObject SAPI.SpVoice; "
-                        "$voice.Speak($text) | Out-Null"
-                    ),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                creationflags=WINDOWS_NO_CONSOLE_FLAGS,
-            )
-            process.stdin.write(text)
-            process.stdin.close()
+            if self.root.focus_get() == self.shortcut_readout:
+                self.settle_book_list_focus(selected_index)
         except Exception:
             pass
 
