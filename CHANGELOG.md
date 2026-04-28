@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Moved NVDA book list announcements into a dedicated Settings, Screen Reader Support submenu with explicit On and Off commands.
 - Added library database backup and restore through a user-chosen synced cloud folder, including Google Drive, OneDrive, iCloud Drive, another folder, daily, weekly, monthly, and on-demand schedules.
 - Fixed Alt+number single-press reading so it exposes the requested field through a normal focused read-only edit control for screen readers such as JAWS, even when that field is not included in the current Book List Speech setting.
 - Added Alt+number shortcuts in the books list:
