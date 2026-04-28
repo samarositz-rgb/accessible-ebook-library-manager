@@ -35,6 +35,7 @@ import urllib.parse
 import urllib.request
 import winsound
 import ctypes
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import (
     Tk,
@@ -78,6 +79,13 @@ BOOK_LIST_SPEECH_FIELDS = [
     ("added_at", "Date added"),
 ]
 DEFAULT_BOOK_LIST_SPEECH_FIELDS = ["title", "author"]
+BACKUP_SCHEDULES = {
+    "on_demand": ("On Demand", None),
+    "daily": ("Daily", timedelta(days=1)),
+    "weekly": ("Weekly", timedelta(days=7)),
+    "monthly": ("Monthly", timedelta(days=30)),
+}
+DEFAULT_BACKUP_SCHEDULE = "on_demand"
 MISSING_METADATA_SOUND_MODES = {
     "author": ("Missing Author Only", ["author"]),
     "useful": ("Missing Author, Edition, or Year", ["author", "edition", "year"]),
@@ -157,6 +165,23 @@ def managed_books_folder(folder: Path) -> Path:
     raise RuntimeError("Could not create a folder for imported books.")
 
 
+def utc_now_text():
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def parse_utc_text(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", ""))
+    except ValueError:
+        return None
+
+
+def cloud_backup_subfolder(base_folder: Path) -> Path:
+    return base_folder / "Accessible Ebook Library Manager Backups"
+
+
 class LibraryDatabase:
     def __init__(self):
         self.folder = app_data_folder()
@@ -221,6 +246,19 @@ class LibraryDatabase:
             (key, value),
         )
         self.connection.commit()
+
+    def backup_to(self, destination: Path):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        backup_connection = sqlite3.connect(destination)
+        try:
+            self.connection.commit()
+            self.connection.backup(backup_connection)
+            backup_connection.commit()
+        finally:
+            backup_connection.close()
+
+    def close(self):
+        self.connection.close()
 
     def add_book(self, title, author, source, tags, notes, original_path, stored_path):
         ext = Path(stored_path).suffix.lower().replace(".", "")
@@ -1596,10 +1634,12 @@ class LibraryApp:
         self.filter_source = ""
         self.filter_tag = ""
         self.filter_format = ""
+        self.backup_check_after = None
 
         self.build_menu()
         self.build_ui()
         self.refresh_books()
+        self.schedule_backup_check(5000)
 
     def build_menu(self):
         menu_bar = Menu(self.root)
@@ -1672,6 +1712,24 @@ class LibraryApp:
         missing_metadata_menu.add_command(label="Show Current Setting", command=self.show_missing_metadata_sound_mode)
         missing_metadata_menu.add_command(label="Test Sound", command=self.test_missing_metadata_sound)
         settings_menu.add_cascade(label="Missing Metadata Sound", menu=missing_metadata_menu)
+        settings_menu.add_separator()
+        backup_menu = Menu(settings_menu, tearoff=False)
+        backup_menu.add_command(label="Use OneDrive Folder...", command=lambda: self.choose_cloud_backup_folder("onedrive"))
+        backup_menu.add_command(label="Use Google Drive Folder...", command=lambda: self.choose_cloud_backup_folder("google_drive"))
+        backup_menu.add_command(label="Use iCloud Drive Folder...", command=lambda: self.choose_cloud_backup_folder("icloud"))
+        backup_menu.add_command(label="Choose Other Backup Folder...", command=lambda: self.choose_cloud_backup_folder("other"))
+        backup_menu.add_separator()
+        schedule_menu = Menu(backup_menu, tearoff=False)
+        schedule_menu.add_command(label="On Demand", command=lambda: self.set_backup_schedule("on_demand"))
+        schedule_menu.add_command(label="Daily", command=lambda: self.set_backup_schedule("daily"))
+        schedule_menu.add_command(label="Weekly", command=lambda: self.set_backup_schedule("weekly"))
+        schedule_menu.add_command(label="Monthly", command=lambda: self.set_backup_schedule("monthly"))
+        backup_menu.add_cascade(label="Backup Schedule", menu=schedule_menu)
+        backup_menu.add_separator()
+        backup_menu.add_command(label="Back Up Now", command=self.backup_library_now)
+        backup_menu.add_command(label="Restore From Backup...", command=self.restore_library_backup)
+        backup_menu.add_command(label="Show Backup Status", command=self.show_backup_status)
+        settings_menu.add_cascade(label="Library Backup", menu=backup_menu)
         settings_menu.add_separator()
         settings_menu.add_command(label="Toggle NVDA Book List Announcements", command=self.toggle_nvda_book_list_announcements)
         settings_menu.add_command(label="Set Voice Dream Loader Folder...", command=self.choose_voice_dream_folder)
@@ -2231,6 +2289,277 @@ class LibraryApp:
             "format": (labels["format"], row[6] or "Unknown"),
             "added_at": (labels["added_at"], row[9] or "Unknown"),
         }
+
+    def backup_schedule_key(self):
+        schedule = self.db.get_setting("backup_schedule", DEFAULT_BACKUP_SCHEDULE)
+        if schedule not in BACKUP_SCHEDULES:
+            return DEFAULT_BACKUP_SCHEDULE
+        return schedule
+
+    def backup_schedule_label(self):
+        return BACKUP_SCHEDULES[self.backup_schedule_key()][0]
+
+    def backup_folder(self):
+        raw = self.db.get_setting("backup_folder", "").strip()
+        if not raw:
+            return None
+        return Path(raw)
+
+    def backup_paths(self):
+        folder = self.backup_folder()
+        if not folder:
+            return None, None, None
+        return folder, folder / "library_backup.db", folder / "library_backup_manifest.json"
+
+    def detected_cloud_folder(self, service):
+        home = Path.home()
+        if service == "onedrive":
+            candidates = [
+                os.environ.get("OneDrive"),
+                os.environ.get("OneDriveConsumer"),
+                os.environ.get("OneDriveCommercial"),
+                str(home / "OneDrive"),
+            ]
+        elif service == "google_drive":
+            candidates = [
+                str(home / "Google Drive"),
+                str(home / "My Drive"),
+                str(home / "Google Drive" / "My Drive"),
+            ]
+        elif service == "icloud":
+            candidates = [
+                str(home / "iCloudDrive"),
+                str(home / "iCloud Drive"),
+                str(home / "iCloudPhotos"),
+            ]
+        else:
+            candidates = []
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return Path(candidate)
+        return None
+
+    def choose_cloud_backup_folder(self, service="other"):
+        labels = {
+            "onedrive": "OneDrive",
+            "google_drive": "Google Drive",
+            "icloud": "iCloud Drive",
+            "other": "cloud",
+        }
+        label = labels.get(service, "cloud")
+        folder = None
+        detected = self.detected_cloud_folder(service)
+        if detected:
+            use_detected = messagebox.askyesno(
+                "Use detected cloud folder?",
+                f"I found this {label} folder:\n\n{detected}\n\nUse it for library database backups?"
+            )
+            if use_detected:
+                folder = detected
+        if folder is None:
+            if service != "other" and not detected:
+                messagebox.showinfo(
+                    "Cloud folder not found",
+                    f"I could not find a {label} folder automatically. Choose the synced folder to use for backups."
+                )
+            chosen = filedialog.askdirectory(title=f"Choose {label} backup folder")
+            if not chosen:
+                self.focus_books_list()
+                return
+            folder = Path(chosen)
+
+        backup_folder = folder
+        if backup_folder.name != "Accessible Ebook Library Manager Backups":
+            backup_folder = cloud_backup_subfolder(backup_folder)
+        try:
+            backup_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror("Backup folder failed", f"Could not create the backup folder.\n\n{exc}")
+            return
+
+        self.db.set_setting("backup_folder", str(backup_folder))
+        self.status_var.set(f"Library backup folder set to {backup_folder}.")
+        messagebox.showinfo(
+            "Library Backup",
+            f"Backups will be saved here:\n\n{backup_folder}\n\nSet a schedule or choose Back Up Now from Settings, Library Backup."
+        )
+        self.schedule_backup_check(1000)
+
+    def set_backup_schedule(self, schedule):
+        if schedule not in BACKUP_SCHEDULES:
+            schedule = DEFAULT_BACKUP_SCHEDULE
+        self.db.set_setting("backup_schedule", schedule)
+        label = BACKUP_SCHEDULES[schedule][0]
+        self.status_var.set(f"Library backup schedule set to {label}.")
+        messagebox.showinfo("Library Backup Schedule", f"Backup schedule set to {label}.")
+        self.schedule_backup_check(1000)
+
+    def backup_manifest(self):
+        _folder, _backup_file, manifest_file = self.backup_paths()
+        if not manifest_file or not manifest_file.exists():
+            return {}
+        try:
+            return json.loads(manifest_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def backup_due(self):
+        schedule = self.backup_schedule_key()
+        interval = BACKUP_SCHEDULES[schedule][1]
+        if interval is None:
+            return False
+        folder, backup_file, _manifest_file = self.backup_paths()
+        if not folder:
+            return False
+        if not backup_file.exists():
+            return True
+        last_backup = parse_utc_text(self.db.get_setting("last_backup_at", ""))
+        if last_backup is None:
+            return True
+        db_mtime = str(self.db.db_path.stat().st_mtime)
+        backed_mtime = self.db.get_setting("last_backup_db_mtime", "")
+        return db_mtime != backed_mtime and datetime.utcnow() - last_backup >= interval
+
+    def schedule_backup_check(self, delay_ms=None):
+        if self.backup_check_after is not None:
+            try:
+                self.root.after_cancel(self.backup_check_after)
+            except Exception:
+                pass
+        if delay_ms is None:
+            delay_ms = 60 * 60 * 1000
+        self.backup_check_after = self.root.after(delay_ms, self.check_library_backup)
+
+    def check_library_backup(self):
+        self.backup_check_after = None
+        try:
+            self.notice_if_cloud_backup_changed()
+            if self.backup_due():
+                self.backup_library_now(automatic=True)
+        finally:
+            self.schedule_backup_check()
+
+    def notice_if_cloud_backup_changed(self):
+        _folder, backup_file, _manifest_file = self.backup_paths()
+        if not backup_file or not backup_file.exists():
+            return
+        current_mtime = str(backup_file.stat().st_mtime)
+        last_seen = self.db.get_setting("last_seen_backup_file_mtime", "")
+        if last_seen and current_mtime != last_seen:
+            self.status_var.set("The cloud library backup changed since the last check. Use Settings, Library Backup, Restore From Backup if you need it.")
+        self.db.set_setting("last_seen_backup_file_mtime", current_mtime)
+
+    def backup_library_now(self, automatic=False):
+        folder, backup_file, manifest_file = self.backup_paths()
+        if not folder:
+            if automatic:
+                return
+            messagebox.showinfo(
+                "Choose backup folder",
+                "Choose a Google Drive, OneDrive, iCloud Drive, or other synced folder before backing up."
+            )
+            self.choose_cloud_backup_folder("other")
+            folder, backup_file, manifest_file = self.backup_paths()
+            if not folder:
+                return
+
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            self.db.backup_to(backup_file)
+            db_mtime = str(self.db.db_path.stat().st_mtime)
+            book_count = self.db.connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            manifest = {
+                "app": APP_NAME,
+                "created_at": utc_now_text(),
+                "source_database": str(self.db.db_path),
+                "backup_database": str(backup_file),
+                "source_database_mtime": db_mtime,
+                "book_count": book_count,
+            }
+            manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            self.db.set_setting("last_backup_at", manifest["created_at"])
+            self.db.set_setting("last_backup_db_mtime", db_mtime)
+            self.db.set_setting("last_seen_backup_file_mtime", str(backup_file.stat().st_mtime))
+            message = f"Library database backed up to {backup_file}."
+            self.status_var.set(message)
+            if not automatic:
+                messagebox.showinfo("Library Backup Complete", message)
+        except Exception as exc:
+            self.status_var.set("Library backup failed.")
+            if not automatic:
+                messagebox.showerror("Library Backup Failed", f"Could not back up the library database.\n\n{exc}")
+
+    def backup_file_is_valid(self, backup_file):
+        try:
+            connection = sqlite3.connect(backup_file)
+            try:
+                row = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='books'"
+                ).fetchone()
+                return row is not None
+            finally:
+                connection.close()
+        except Exception:
+            return False
+
+    def restore_library_backup(self):
+        folder, backup_file, _manifest_file = self.backup_paths()
+        if not folder:
+            messagebox.showinfo("No backup folder", "Choose a backup folder before restoring.")
+            self.choose_cloud_backup_folder("other")
+            folder, backup_file, _manifest_file = self.backup_paths()
+            if not folder:
+                return
+        if not backup_file.exists():
+            messagebox.showerror("No backup found", f"No library backup was found here:\n\n{backup_file}")
+            return
+        if not self.backup_file_is_valid(backup_file):
+            messagebox.showerror("Backup not valid", "The backup file does not look like an Accessible Ebook Library Manager database.")
+            return
+
+        if not messagebox.askyesno(
+            "Restore Library Backup",
+            "Restore the cloud backup over the current local library database?\n\n"
+            "The current local database will be saved as a safety copy first."
+        ):
+            self.focus_books_list()
+            return
+
+        preserved_folder = self.db.get_setting("backup_folder", "")
+        preserved_schedule = self.db.get_setting("backup_schedule", DEFAULT_BACKUP_SCHEDULE)
+        safety_copy = self.db.folder / f"library_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        try:
+            self.db.connection.commit()
+            shutil.copy2(self.db.db_path, safety_copy)
+            self.db.close()
+            shutil.copy2(backup_file, self.db.db_path)
+            self.db = LibraryDatabase()
+            self.db.set_setting("backup_folder", preserved_folder)
+            self.db.set_setting("backup_schedule", preserved_schedule)
+            self.refresh_books()
+            self.settle_book_list_focus()
+            message = f"Library restored from backup. Safety copy saved at {safety_copy}."
+            self.status_var.set(message)
+            messagebox.showinfo("Library Restored", message)
+        except Exception as exc:
+            try:
+                self.db = LibraryDatabase()
+            except Exception:
+                pass
+            messagebox.showerror("Restore Failed", f"Could not restore the library backup.\n\n{exc}")
+
+    def show_backup_status(self):
+        folder, backup_file, manifest_file = self.backup_paths()
+        manifest = self.backup_manifest()
+        text = (
+            f"Backup folder: {folder or 'Not set'}\n"
+            f"Schedule: {self.backup_schedule_label()}\n"
+            f"Last backup: {self.db.get_setting('last_backup_at', 'Never') or 'Never'}\n"
+            f"Backup file: {backup_file if backup_file and backup_file.exists() else 'Not found'}\n"
+            f"Manifest file: {manifest_file if manifest_file and manifest_file.exists() else 'Not found'}\n"
+            f"Books in last manifest: {manifest.get('book_count', 'Unknown')}"
+        )
+        messagebox.showinfo("Library Backup Status", text)
 
     def focus_search(self):
         value = AccessibleSingleFieldDialog.ask(
@@ -4247,6 +4576,7 @@ catch {
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
             "Use Settings, Book List Speech, to choose title only, title and author, title author and edition, or full details.\n"
             "Use Settings, Missing Metadata Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
+            "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local database is lost.\n"
             "Use Settings, Toggle NVDA Book List Announcements, if NVDA does not automatically read book list rows.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
             "Use File, Send To, NLS eReader, to copy the selected book to a connected NLS eReader. If the app cannot detect it, you can choose the eReader folder manually.\n"
