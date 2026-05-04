@@ -27,6 +27,7 @@ import traceback
 import zipfile
 import re
 import html
+import posixpath
 import tkinter as tk
 import json
 import tempfile
@@ -84,6 +85,14 @@ BOOK_LIST_SPEECH_FIELDS = [
 ]
 DEFAULT_BOOK_LIST_SPEECH_FIELDS = ["title", "author"]
 NO_EDITION_VALUE = "No edition"
+ACCESSIBILITY_METADATA_KEYS = [
+    "accessibility_summary",
+    "accessibility_features",
+    "accessibility_hazards",
+    "accessibility_access_modes",
+    "accessibility_access_modes_sufficient",
+    "accessibility_certified_by",
+]
 EXPLORER_CONTEXT_MENU_KEY = "AccessibleEbookLibraryManagerAdd"
 EXPLORER_CONTEXT_MENU_LABEL = "Add to Accessible Ebook Library Manager"
 BACKUP_SCHEDULES = {
@@ -245,6 +254,12 @@ class LibraryDatabase:
             "isbn": "TEXT DEFAULT ''",
             "publisher": "TEXT DEFAULT ''",
             "cover_url": "TEXT DEFAULT ''",
+            "accessibility_summary": "TEXT DEFAULT ''",
+            "accessibility_features": "TEXT DEFAULT ''",
+            "accessibility_hazards": "TEXT DEFAULT ''",
+            "accessibility_access_modes": "TEXT DEFAULT ''",
+            "accessibility_access_modes_sufficient": "TEXT DEFAULT ''",
+            "accessibility_certified_by": "TEXT DEFAULT ''",
         }
         for name, column_type in columns.items():
             if name not in existing:
@@ -309,6 +324,31 @@ class LibraryDatabase:
         )
         self.connection.commit()
 
+    def update_accessibility_metadata(self, book_id, metadata):
+        values = {key: str(metadata.get(key, "") or "") for key in ACCESSIBILITY_METADATA_KEYS}
+        self.connection.execute(
+            """
+            UPDATE books
+            SET accessibility_summary = ?,
+                accessibility_features = ?,
+                accessibility_hazards = ?,
+                accessibility_access_modes = ?,
+                accessibility_access_modes_sufficient = ?,
+                accessibility_certified_by = ?
+            WHERE id = ?
+            """,
+            (
+                values["accessibility_summary"],
+                values["accessibility_features"],
+                values["accessibility_hazards"],
+                values["accessibility_access_modes"],
+                values["accessibility_access_modes_sufficient"],
+                values["accessibility_certified_by"],
+                book_id,
+            ),
+        )
+        self.connection.commit()
+
     def update_book(self, book_id, title, author, source, tags, notes):
         self.connection.execute(
             """
@@ -336,7 +376,9 @@ class LibraryDatabase:
         cursor = self.connection.execute(
             """
             SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
-                   edition, year, isbn, publisher, cover_url
+                   edition, year, isbn, publisher, cover_url,
+                   accessibility_summary, accessibility_features, accessibility_hazards,
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
             FROM books
             ORDER BY title COLLATE NOCASE, author COLLATE NOCASE, added_at
             """
@@ -347,7 +389,9 @@ class LibraryDatabase:
         cursor = self.connection.execute(
             """
             SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
-                   edition, year, isbn, publisher, cover_url
+                   edition, year, isbn, publisher, cover_url,
+                   accessibility_summary, accessibility_features, accessibility_hazards,
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
             FROM books WHERE id = ?
             """,
             (book_id,),
@@ -389,9 +433,15 @@ class LibraryDatabase:
                    OR year LIKE ?
                    OR isbn LIKE ?
                    OR publisher LIKE ?
+                   OR accessibility_summary LIKE ?
+                   OR accessibility_features LIKE ?
+                   OR accessibility_hazards LIKE ?
+                   OR accessibility_access_modes LIKE ?
+                   OR accessibility_access_modes_sufficient LIKE ?
+                   OR accessibility_certified_by LIKE ?
                 )"""
             )
-            params.extend([like] * 10)
+            params.extend([like] * 16)
 
         if source_filter:
             conditions.append("source LIKE ?")
@@ -487,6 +537,118 @@ def read_epub_metadata(epub_path: Path) -> dict:
         }
     except Exception:
         return {}
+
+
+def metadata_values_by_property(root, property_name):
+    values = []
+    for item in root.findall(".//opf:meta", {"opf": OPF_NS}):
+        if item.attrib.get("property") == property_name and item.text:
+            values.append(item.text.strip())
+    return values
+
+
+def first_metadata_value_by_property(root, property_name):
+    values = metadata_values_by_property(root, property_name)
+    return values[0] if values else ""
+
+
+def opf_relative_path(opf_path, href):
+    base = posixpath.dirname(opf_path)
+    return posixpath.normpath(posixpath.join(base, href))
+
+
+def read_epub_accessibility_metadata(epub_path: Path) -> dict:
+    result = {key: "" for key in ACCESSIBILITY_METADATA_KEYS}
+    try:
+        opf_path = get_epub_opf_path(epub_path)
+        with zipfile.ZipFile(epub_path, "r") as archive:
+            opf_xml = archive.read(opf_path)
+            names = set(archive.namelist())
+            root = ET.fromstring(opf_xml)
+            ns = {"opf": OPF_NS}
+
+            declared_features = metadata_values_by_property(root, "schema:accessibilityFeature")
+            declared_hazards = metadata_values_by_property(root, "schema:accessibilityHazard")
+            access_modes = metadata_values_by_property(root, "schema:accessMode")
+            access_modes_sufficient = metadata_values_by_property(root, "schema:accessModeSufficient")
+            summary = first_metadata_value_by_property(root, "schema:accessibilitySummary")
+            certified_by = (
+                first_metadata_value_by_property(root, "a11y:certifiedBy")
+                or first_metadata_value_by_property(root, "schema:accessibilityAPI")
+            )
+
+            manifest_items = []
+            nav_present = False
+            page_list_present = False
+            ncx_present = False
+            for item in root.findall(".//opf:manifest/opf:item", ns):
+                href = item.attrib.get("href", "")
+                media_type = item.attrib.get("media-type", "")
+                properties = item.attrib.get("properties", "")
+                full_path = opf_relative_path(opf_path, href) if href else ""
+                manifest_items.append((full_path, media_type, properties))
+                if "nav" in properties.split():
+                    nav_present = True
+                if media_type == "application/x-dtbncx+xml":
+                    ncx_present = True
+
+            content_paths = [
+                path for path, media_type, _properties in manifest_items
+                if media_type in {"application/xhtml+xml", "text/html"} and path in names
+            ]
+            image_total = 0
+            image_with_alt = 0
+            heading_count = 0
+            lang_present = False
+            for content_path in content_paths[:80]:
+                try:
+                    text = archive.read(content_path).decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                for match in re.finditer(r"<img\b[^>]*>", text, flags=re.IGNORECASE):
+                    image_total += 1
+                    if re.search(r"\balt\s*=\s*(['\"])[\s\S]*?\1", match.group(0), flags=re.IGNORECASE):
+                        image_with_alt += 1
+                heading_count += len(re.findall(r"<h[1-6]\b", text, flags=re.IGNORECASE))
+                if re.search(r"\b(?:xml:)?lang\s*=", text, flags=re.IGNORECASE):
+                    lang_present = True
+                if re.search(r"epub:type\s*=\s*(['\"])[^'\"]*\bpage-list\b", text, flags=re.IGNORECASE):
+                    page_list_present = True
+
+            inferred_features = []
+            if nav_present or ncx_present:
+                inferred_features.append("tableOfContents")
+            if page_list_present:
+                inferred_features.append("pageNavigation")
+            if heading_count:
+                inferred_features.append("structuralNavigation")
+            if image_total and image_with_alt == image_total:
+                inferred_features.append("alternativeText")
+
+            hazards = declared_hazards or ["unknown"]
+            features = sorted(set(declared_features + inferred_features), key=str.casefold)
+            result["accessibility_features"] = ", ".join(features)
+            result["accessibility_hazards"] = ", ".join(hazards)
+            result["accessibility_access_modes"] = ", ".join(access_modes)
+            result["accessibility_access_modes_sufficient"] = "; ".join(access_modes_sufficient)
+            result["accessibility_certified_by"] = certified_by
+
+            checks = []
+            checks.append("navigation present" if nav_present or ncx_present else "navigation not found")
+            checks.append("page list present" if page_list_present else "page list not found")
+            if image_total:
+                checks.append(f"image alt text {image_with_alt} of {image_total}")
+            else:
+                checks.append("no images found")
+            checks.append(f"{heading_count} heading{'s' if heading_count != 1 else ''} found")
+            checks.append("language declared" if lang_present else "language not found")
+            if summary:
+                result["accessibility_summary"] = f"{summary} Checked by app: {', '.join(checks)}."
+            else:
+                result["accessibility_summary"] = "Checked by app: " + ", ".join(checks) + "."
+            return result
+    except Exception:
+        return result
 
 
 def set_single_text(metadata_element, tag_name, value):
@@ -1708,6 +1870,7 @@ class LibraryApp:
         book_menu = Menu(menu_bar, tearoff=False)
         book_menu.add_command(label="Edit Metadata...\tF2", command=self.edit_book)
         book_menu.add_command(label="Auto-Detect Metadata...\tCtrl+D", command=self.auto_detect_selected_metadata)
+        book_menu.add_command(label="Check EPUB Accessibility Metadata...", command=self.check_selected_epub_accessibility)
         book_menu.add_command(label="Look Up Metadata Online...", command=self.lookup_selected_metadata_online)
         book_menu.add_command(label="View Cover Image...", command=self.view_selected_cover_image)
         book_menu.add_command(label="Convert to EPUB...\tCtrl+R", command=self.convert_selected_to_epub)
@@ -3023,6 +3186,7 @@ class LibraryApp:
                 f"ISBN: {row[12] or 'Not specified'}\n"
                 f"Publisher: {row[13] or 'Not specified'}\n"
                 f"Cover image: {'Available' if len(row) > 14 and row[14] else 'Not saved'}\n"
+                f"EPUB accessibility:\n{self.accessibility_text_from_row(row)}\n"
                 f"Source: {row[3] or 'Not specified'}\n"
                 f"Tags: {row[4] or 'None'}\n"
                 f"Format: {row[6] or 'Unknown'}\n"
@@ -3049,6 +3213,28 @@ class LibraryApp:
             messagebox.showerror(title, message)
         except Exception:
             pass
+
+    def update_accessibility_from_epub(self, book_id, stored_path):
+        path = Path(stored_path)
+        if path.suffix.lower() != ".epub" or not path.exists():
+            return {}
+        metadata = read_epub_accessibility_metadata(path)
+        self.db.update_accessibility_metadata(book_id, metadata)
+        return metadata
+
+    def accessibility_text_from_row(self, row):
+        if not row or len(row) <= 20:
+            return "Not checked"
+        labels = [
+            ("Accessibility summary", row[15]),
+            ("Accessibility features", row[16]),
+            ("Accessibility hazards", row[17]),
+            ("Access modes", row[18]),
+            ("Access modes sufficient", row[19]),
+            ("Certified by", row[20]),
+        ]
+        parts = [f"{label}: {value}" for label, value in labels if value]
+        return "\n".join(parts) if parts else "Not checked"
 
     def extract_supported_files_from_zip(self, zip_path: Path) -> list[Path]:
         """Extract a ZIP file and return supported ebook/document files inside it.
@@ -3286,6 +3472,7 @@ class LibraryApp:
             metadata.get("isbn", ""),
             metadata.get("publisher", ""),
         )
+        self.update_accessibility_from_epub(new_book_id, destination)
         return True
 
     def import_folder(self):
@@ -3488,6 +3675,7 @@ class LibraryApp:
                 metadata.get("isbn", ""),
                 metadata.get("publisher", ""),
             )
+            self.update_accessibility_from_epub(new_book_id, destination)
             added += 1
 
         self.refresh_books()
@@ -3515,6 +3703,12 @@ class LibraryApp:
             "tags": row[4],
             "notes": row[5],
             "cover_url": row[14] if len(row) > 14 else "",
+            "accessibility_summary": row[15] if len(row) > 15 else "",
+            "accessibility_features": row[16] if len(row) > 16 else "",
+            "accessibility_hazards": row[17] if len(row) > 17 else "",
+            "accessibility_access_modes": row[18] if len(row) > 18 else "",
+            "accessibility_access_modes_sufficient": row[19] if len(row) > 19 else "",
+            "accessibility_certified_by": row[20] if len(row) > 20 else "",
         }
 
     def merge_online_metadata(self, existing, online, replace_existing=False):
@@ -3548,6 +3742,7 @@ class LibraryApp:
 
         stored_path = Path(row[8])
         if stored_path.suffix.lower() == ".epub" and stored_path.exists():
+            self.update_accessibility_from_epub(book_id, stored_path)
             try:
                 write_epub_metadata(
                     stored_path,
@@ -3607,8 +3802,38 @@ class LibraryApp:
             return
 
         self.save_metadata_for_book(book_id, row, metadata, status_prefix="Detected metadata saved")
+        self.update_accessibility_from_epub(book_id, row[8])
         self.refresh_books(selected_book_id=book_id)
         self.focus_books_list()
+
+    def check_selected_epub_accessibility(self):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return
+
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return
+
+        stored_path = Path(row[8])
+        if stored_path.suffix.lower() != ".epub":
+            messagebox.showinfo("EPUB only", "Accessibility checking is currently available for EPUB books.")
+            return
+        if not stored_path.exists():
+            messagebox.showerror("Book file missing", "The stored EPUB file could not be found.")
+            return
+
+        self.status_var.set("Checking EPUB accessibility metadata.")
+        metadata = self.update_accessibility_from_epub(book_id, stored_path)
+        self.refresh_books(selected_book_id=book_id)
+        updated_row = self.db.get_book(book_id)
+        text = self.accessibility_text_from_row(updated_row)
+        self.status_var.set("EPUB accessibility metadata checked.")
+        messagebox.showinfo(
+            "EPUB Accessibility Metadata",
+            text if metadata else "No accessibility metadata could be checked for this EPUB."
+        )
 
     def lookup_selected_metadata_online(self):
         book_id = self.selected_book_id()
@@ -3767,6 +3992,7 @@ class LibraryApp:
 
         stored_path = Path(row[8])
         if stored_path.suffix.lower() == ".epub" and stored_path.exists():
+            self.update_accessibility_from_epub(book_id, stored_path)
             try:
                 write_epub_metadata(
                     stored_path,
@@ -3936,6 +4162,7 @@ class LibraryApp:
 
         new_book_id = self.db.add_book(row[1], row[2], row[3], row[4], row[5], str(source_file), str(output_path))
         self.db.update_extra_fields(new_book_id, row[10], row[11], row[12], row[13])
+        self.update_accessibility_from_epub(new_book_id, output_path)
         self.refresh_books()
         self.focus_books_list()
         messagebox.showinfo("Conversion complete", "The EPUB was created and added to your library.")
@@ -4763,6 +4990,7 @@ catch {
             "Control+Shift+N: Import a folder of books, including Bookshare ZIP files.\n"
             "F2: Edit selected book metadata. On Windows, the metadata editor uses native edit boxes so screen readers can read field names, contents, and typed text. Use Tab and Shift+Tab to move between fields.\n"
             "Control+D: Auto-detect metadata from the selected book.\n"
+            "Use Book, Check EPUB Accessibility Metadata, to inspect the selected EPUB for package accessibility metadata, navigation, page list, heading structure, language, and image alt text coverage.\n"
             "Use the Book menu, Look Up Book Metadata from Internet, to search Open Library and Google Books for metadata.\n"
             "Use the Book menu, View Cover Image, to open a visual cover image when one is available or look one up online.\n"
             "Enter or Control+O: Open selected book.\n"

@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Added EPUB accessibility checking that inspects package metadata, navigation, page list, headings, language, and image alt text coverage, then stores the results with the book metadata.
 - Added optional Windows File Explorer right-click integration for importing supported files directly into the manager.
 - Added a No edition marker in the metadata editor so books without an edition statement can be identified clearly.
 - Polished menu labels and common error messages for tester-facing builds.
