@@ -37,6 +37,10 @@ import winsound
 import ctypes
 from datetime import datetime, timedelta
 from pathlib import Path
+try:
+    import winreg
+except ImportError:
+    winreg = None
 from tkinter import (
     Tk,
     StringVar,
@@ -80,6 +84,8 @@ BOOK_LIST_SPEECH_FIELDS = [
 ]
 DEFAULT_BOOK_LIST_SPEECH_FIELDS = ["title", "author"]
 NO_EDITION_VALUE = "No edition"
+EXPLORER_CONTEXT_MENU_KEY = "AccessibleEbookLibraryManagerAdd"
+EXPLORER_CONTEXT_MENU_LABEL = "Add to Accessible Ebook Library Manager"
 BACKUP_SCHEDULES = {
     "on_demand": ("On Demand", None),
     "daily": ("Daily", timedelta(days=1)),
@@ -181,6 +187,17 @@ def parse_utc_text(value):
 
 def cloud_backup_subfolder(base_folder: Path) -> Path:
     return base_folder / "Accessible Ebook Library Manager Backups"
+
+
+def app_launch_command_for_file_argument():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --import "%1"'
+
+    executable = Path(sys.executable)
+    pythonw = executable.with_name("pythonw.exe")
+    launcher = pythonw if pythonw.exists() else executable
+    script = Path(__file__).resolve()
+    return f'"{launcher}" "{script}" --import "%1"'
 
 
 class LibraryDatabase:
@@ -1668,6 +1685,7 @@ class LibraryApp:
         self.build_ui()
         self.refresh_books()
         self.schedule_backup_check(5000)
+        self.root.after(750, self.import_command_line_files)
 
     def build_menu(self):
         menu_bar = Menu(self.root)
@@ -1768,6 +1786,12 @@ class LibraryApp:
         backup_menu.add_command(label="Restore From Backup...", command=self.restore_library_backup)
         backup_menu.add_command(label="Show Backup Status", command=self.show_backup_status)
         settings_menu.add_cascade(label="Library Backup", menu=backup_menu)
+        settings_menu.add_separator()
+        explorer_menu = Menu(settings_menu, tearoff=False)
+        explorer_menu.add_command(label="Add File Explorer Right-Click Command", command=self.install_file_explorer_context_menu)
+        explorer_menu.add_command(label="Remove File Explorer Right-Click Command", command=self.remove_file_explorer_context_menu)
+        explorer_menu.add_command(label="Show File Explorer Integration Status", command=self.show_file_explorer_context_menu_status)
+        settings_menu.add_cascade(label="File Explorer Integration", menu=explorer_menu)
         settings_menu.add_separator()
         settings_menu.add_command(label="Set Voice Dream Loader Folder...", command=self.choose_voice_dream_folder)
         settings_menu.add_command(label="Set NLS eReader Folder...", command=self.choose_nls_ereader_folder)
@@ -2599,6 +2623,100 @@ class LibraryApp:
         )
         messagebox.showinfo("Library Backup Status", text)
 
+    def explorer_context_menu_registry_paths(self):
+        paths = []
+        for extension in sorted(SUPPORTED_EXTENSIONS):
+            paths.append(
+                rf"Software\Classes\SystemFileAssociations\{extension}\shell\{EXPLORER_CONTEXT_MENU_KEY}"
+            )
+        return paths
+
+    def delete_registry_tree(self, root, subkey):
+        if winreg is None:
+            return
+        try:
+            with winreg.OpenKey(root, subkey, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+                while True:
+                    try:
+                        child = winreg.EnumKey(key, 0)
+                    except OSError:
+                        break
+                    self.delete_registry_tree(root, subkey + "\\" + child)
+            winreg.DeleteKey(root, subkey)
+        except FileNotFoundError:
+            pass
+
+    def install_file_explorer_context_menu(self):
+        if not sys.platform.startswith("win") or winreg is None:
+            messagebox.showinfo(
+                "Windows only",
+                "File Explorer right-click integration is only available on Windows."
+            )
+            return
+        command = app_launch_command_for_file_argument()
+        try:
+            for menu_path in self.explorer_context_menu_registry_paths():
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, menu_path) as key:
+                    winreg.SetValueEx(key, "", 0, winreg.REG_SZ, EXPLORER_CONTEXT_MENU_LABEL)
+                    winreg.SetValueEx(key, "Icon", 0, winreg.REG_SZ, sys.executable)
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, menu_path + r"\command") as key:
+                    winreg.SetValueEx(key, "", 0, winreg.REG_SZ, command)
+            self.status_var.set("File Explorer right-click command installed.")
+            messagebox.showinfo(
+                "File Explorer Integration",
+                "Installed the File Explorer right-click command for supported ebook and document files.\n\n"
+                f"Command name: {EXPLORER_CONTEXT_MENU_LABEL}"
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "File Explorer integration failed",
+                f"Could not install the right-click command.\n\n{exc}"
+            )
+
+    def remove_file_explorer_context_menu(self):
+        if not sys.platform.startswith("win") or winreg is None:
+            messagebox.showinfo(
+                "Windows only",
+                "File Explorer right-click integration is only available on Windows."
+            )
+            return
+        try:
+            for menu_path in self.explorer_context_menu_registry_paths():
+                self.delete_registry_tree(winreg.HKEY_CURRENT_USER, menu_path)
+            self.status_var.set("File Explorer right-click command removed.")
+            messagebox.showinfo(
+                "File Explorer Integration",
+                "Removed the File Explorer right-click command."
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "File Explorer integration failed",
+                f"Could not remove the right-click command.\n\n{exc}"
+            )
+
+    def file_explorer_context_menu_installed_count(self):
+        if not sys.platform.startswith("win") or winreg is None:
+            return 0
+        count = 0
+        for menu_path in self.explorer_context_menu_registry_paths():
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, menu_path):
+                    count += 1
+            except FileNotFoundError:
+                pass
+        return count
+
+    def show_file_explorer_context_menu_status(self):
+        total = len(SUPPORTED_EXTENSIONS)
+        installed = self.file_explorer_context_menu_installed_count()
+        command = app_launch_command_for_file_argument()
+        messagebox.showinfo(
+            "File Explorer Integration Status",
+            f"Right-click entries installed: {installed} of {total}\n\n"
+            f"Command name: {EXPLORER_CONTEXT_MENU_LABEL}\n\n"
+            f"Launch command:\n{command}"
+        )
+
     def focus_search(self):
         value = AccessibleSingleFieldDialog.ask(
             self.root,
@@ -3057,6 +3175,67 @@ class LibraryApp:
 
         report_path.write_text("\n".join(lines), encoding="utf-8")
         return report_path
+
+    def command_line_import_paths(self):
+        args = sys.argv[1:]
+        paths = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--import":
+                index += 1
+                if index < len(args):
+                    paths.append(Path(args[index]))
+            elif arg.startswith("--import="):
+                paths.append(Path(arg.split("=", 1)[1]))
+            elif not arg.startswith("-"):
+                candidate = Path(arg)
+                if candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    paths.append(candidate)
+            index += 1
+        return paths
+
+    def import_command_line_files(self):
+        paths = self.command_line_import_paths()
+        if not paths:
+            return
+
+        imported = 0
+        skipped = []
+        for path in paths:
+            try:
+                if path.suffix.lower() == ".zip":
+                    zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="File Explorer")
+                    imported += zip_imported
+                    skipped.extend(zip_skipped)
+                elif self.import_one_book_without_prompt(path, default_source="File Explorer"):
+                    imported += 1
+                else:
+                    skipped.append(f"{path} -- unsupported or not imported")
+            except sqlite3.IntegrityError:
+                skipped.append(f"{path} -- already imported or duplicate stored path")
+            except Exception as exc:
+                skipped.append(f"{path} -- {exc}")
+
+        self.refresh_books()
+        if imported:
+            self.focus_books_list()
+        report_path = self.write_import_report(imported, skipped)
+        self.status_var.set(
+            f"File Explorer import complete. Imported {imported}. Skipped {len(skipped)}."
+        )
+        if skipped:
+            messagebox.showwarning(
+                "File Explorer import finished with warnings",
+                f"Imported {imported} book{'s' if imported != 1 else ''}. "
+                f"Skipped {len(skipped)} item{'s' if len(skipped) != 1 else ''}.\n\n"
+                f"Import report saved at:\n{report_path}"
+            )
+        else:
+            messagebox.showinfo(
+                "File Explorer import complete",
+                f"Imported {imported} book{'s' if imported != 1 else ''}."
+            )
 
     def import_one_book_without_prompt(self, source_path: Path, default_source: str = "") -> bool:
         if source_path.suffix.lower() == ".zip":
@@ -4607,6 +4786,7 @@ catch {
             "Use Settings, Book List Reading, to choose title only, title and author, title author and edition, or all details.\n"
             "Use Settings, Missing Metadata Alert Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
             "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local database is lost.\n"
+            "Use Settings, File Explorer Integration, to add or remove a Windows right-click command for adding supported files directly from File Explorer.\n"
             "If NVDA is running and its controller is available, the app automatically uses NVDA book list announcements. No setting is needed.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
             "Use File, Send To, NLS eReader, to copy the selected book to a connected NLS eReader. If the app cannot detect it, you can choose the eReader folder manually.\n"

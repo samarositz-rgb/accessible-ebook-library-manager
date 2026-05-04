@@ -2,6 +2,7 @@
 
 ## 0.2 - 2026-04-28
 
+- Added optional Windows File Explorer right-click integration for importing supported files directly into the manager.
 - Added a No edition marker in the metadata editor so books without an edition statement can be identified clearly.
 - Polished menu labels and common error messages for tester-facing builds.
 - Moved filter commands into an Organize, Filter submenu and removed the older Read Current Book command.
