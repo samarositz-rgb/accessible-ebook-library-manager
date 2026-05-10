@@ -1876,6 +1876,7 @@ class LibraryApp:
         book_menu.add_command(label="Convert to EPUB...\tCtrl+R", command=self.convert_selected_to_epub)
         book_menu.add_command(label="Show Book Details\tCtrl+I", command=self.show_selected_book_info)
         book_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
+        book_menu.add_command(label="Select All Books\tCtrl+A", command=self.select_all_books)
         book_menu.add_command(label="Deselect All Books\tCtrl+Shift+A", command=self.deselect_all_books)
         book_menu.add_command(label="Delete from Library\tDelete", command=self.delete_book)
         menu_bar.add_cascade(label="Book", menu=book_menu, underline=0)
@@ -2013,6 +2014,7 @@ class LibraryApp:
         self.book_list.bind("<Control-f>", self.focus_search_from_keyboard)
         self.book_list.bind("<Control-i>", lambda event: self.show_selected_book_info())
         self.book_list.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
+        self.book_list.bind("<Control-a>", self.select_all_books)
         self.book_list.bind("<Control-A>", lambda event: self.deselect_all_books())
         self.book_list.bind("<Control-space>", self.toggle_mark_current_book)
         self.book_list.bind("<Escape>", self.clear_search_from_keyboard)
@@ -2033,6 +2035,7 @@ class LibraryApp:
         self.root.bind("<Control-i>", lambda event: self.show_selected_book_info())
         self.root.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
         self.root.bind("<Control-l>", lambda event: self.focus_books_list())
+        self.root.bind("<Control-a>", self.select_all_books)
         self.root.bind("<Control-A>", lambda event: self.deselect_all_books())
         self.root.bind("<Escape>", self.clear_search_from_keyboard)
         self.root.bind("<F1>", lambda event: self.show_help())
@@ -2954,6 +2957,21 @@ class LibraryApp:
         self.refresh_books(selected_book_id=book_id)
         self.root.after(75, lambda selected_index=index: self.settle_book_list_focus(selected_index))
         self.status_var.set(f"Book {state}. {len(self.marked_book_ids)} book{'s' if len(self.marked_book_ids) != 1 else ''} selected.")
+        return "break"
+
+    def select_all_books(self, event=None):
+        if event is not None and isinstance(event.widget, (tk.Entry, tk.Text)):
+            return None
+        if not self.book_list_ids:
+            self.status_var.set("No books are shown to select.")
+            self.focus_books_list()
+            return "break"
+        index = self.current_book_index()
+        self.marked_book_ids.update(self.book_list_ids)
+        self.refresh_books()
+        self.root.after(75, lambda: self.settle_book_list_focus(index))
+        count = len(self.book_list_ids)
+        self.status_var.set(f"Selected all {count} shown book{'s' if count != 1 else ''}.")
         return "break"
 
     def deselect_all_books(self, event=None):
@@ -5001,6 +5019,7 @@ catch {
             "Control+Shift+E: Send selected book to an NLS eReader if it is connected.\n"
             "Use File, Send To, HumanWare Braille eReader MTP, for HumanWare devices that appear under This PC but do not have a normal drive letter.\n"
             "Control+Space: Select or unselect the current book for batch actions. Kindle, Export, and Delete use selected books when any are selected.\n"
+            "Control+A: Select all shown books for batch actions.\n"
             "Control+Shift+A: Deselect all books selected for batch actions.\n"
             "Control+K: Open Kindle for PC.\n"
             "Delete: Remove selected book from library.\n"
