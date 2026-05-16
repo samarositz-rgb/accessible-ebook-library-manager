@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3 - 2026-05-16
+
+- Improved metadata detection for law textbook PDFs and DOCX files, including stronger title-page detection, noisy PDF title rejection, ISBN-13 preference, edition detection, and safer author and publisher guesses.
+- Added Home and End keyboard navigation in the books list.
+- Expanded library backup and restore so cloud backups include both the database and imported book files.
+- Added regression tests for importer metadata detection and folder backup syncing.
+
 ## 0.2 - 2026-04-28
 
 - Added EPUB accessibility checking that inspects package metadata, navigation, page list, headings, language, and image alt text coverage, then stores the results with the book metadata.

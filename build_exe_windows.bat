@@ -39,6 +39,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo Installing PDF text support if needed...
+python -m pip install --upgrade pypdf
+if errorlevel 1 (
+  echo Could not install PDF text support.
+  pause
+  exit /b 1
+)
+
 echo Building the EXE. This may take a few minutes.
 python -m PyInstaller --onefile --windowed --name "Accessible Ebook Library Manager" library_manager.py
 if errorlevel 1 (

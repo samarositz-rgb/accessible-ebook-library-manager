@@ -19,6 +19,7 @@ This app does not remove DRM. It manages files you are allowed to copy and read.
 """
 
 import os
+import filecmp
 import shutil
 import sqlite3
 import subprocess
@@ -30,8 +31,11 @@ import html
 import posixpath
 import tkinter as tk
 import json
+import queue
 import tempfile
+import threading
 import time
+import uuid
 import urllib.parse
 import urllib.request
 import winsound
@@ -70,6 +74,10 @@ SUPPORTED_EXTENSIONS = {
     ".epub", ".pdf", ".docx", ".doc", ".txt", ".rtf",
     ".mobi", ".azw", ".azw3", ".html", ".htm", ".zip"
 }
+VOICE_DREAM_LIBRARY_NOTICE = (
+    "Please do not delete this file, or any files within these folders. "
+    "This is your voice dream library, and we cannot recover deleted files."
+)
 
 BOOK_LIST_SPEECH_FIELDS = [
     ("title", "Title"),
@@ -196,6 +204,72 @@ def parse_utc_text(value):
 
 def cloud_backup_subfolder(base_folder: Path) -> Path:
     return base_folder / "Accessible Ebook Library Manager Backups"
+
+
+def folder_file_stats(folder: Path) -> tuple[int, int]:
+    if not folder or not folder.exists():
+        return 0, 0
+    file_count = 0
+    byte_count = 0
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            byte_count += path.stat().st_size
+            file_count += 1
+        except OSError:
+            continue
+    return file_count, byte_count
+
+
+def files_need_copy(source: Path, destination: Path) -> bool:
+    if not destination.exists():
+        return True
+    try:
+        source_stat = source.stat()
+        destination_stat = destination.stat()
+    except OSError:
+        return True
+    return (
+        source_stat.st_size != destination_stat.st_size
+        or int(source_stat.st_mtime) != int(destination_stat.st_mtime)
+    )
+
+
+def sync_folder_contents(source_folder: Path, destination_folder: Path):
+    source_folder.mkdir(parents=True, exist_ok=True)
+    destination_folder.mkdir(parents=True, exist_ok=True)
+    source_files = set()
+
+    for source_path in source_folder.rglob("*"):
+        relative = source_path.relative_to(source_folder)
+        destination_path = destination_folder / relative
+        if source_path.is_dir():
+            destination_path.mkdir(parents=True, exist_ok=True)
+            continue
+        if not source_path.is_file():
+            continue
+        source_files.add(relative)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if files_need_copy(source_path, destination_path):
+            shutil.copy2(source_path, destination_path)
+
+    for destination_path in sorted(destination_folder.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        relative = destination_path.relative_to(destination_folder)
+        if destination_path.is_file() and relative not in source_files:
+            destination_path.unlink()
+        elif destination_path.is_dir():
+            try:
+                destination_path.rmdir()
+            except OSError:
+                pass
+
+
+def replace_folder_from_backup(backup_folder: Path, target_folder: Path):
+    if not backup_folder.exists() or not backup_folder.is_dir():
+        return
+    target_folder.mkdir(parents=True, exist_ok=True)
+    sync_folder_contents(backup_folder, target_folder)
 
 
 def app_launch_command_for_file_argument():
@@ -395,6 +469,19 @@ class LibraryDatabase:
             FROM books WHERE id = ?
             """,
             (book_id,),
+        )
+        return cursor.fetchone()
+
+    def get_book_by_original_path(self, original_path):
+        cursor = self.connection.execute(
+            """
+            SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
+                   edition, year, isbn, publisher, cover_url,
+                   accessibility_summary, accessibility_features, accessibility_hazards,
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
+            FROM books WHERE original_path = ?
+            """,
+            (original_path,),
         )
         return cursor.fetchone()
 
@@ -666,6 +753,25 @@ def set_single_text(metadata_element, tag_name, value):
             metadata_element.remove(item)
 
 
+def set_single_meta_property(metadata_element, property_name, value):
+    existing = [
+        item for item in metadata_element.findall(f"{{{OPF_NS}}}meta")
+        if item.attrib.get("property") == property_name
+    ]
+    if value:
+        if existing:
+            existing[0].text = value
+            for extra in existing[1:]:
+                metadata_element.remove(extra)
+        else:
+            item = ET.SubElement(metadata_element, f"{{{OPF_NS}}}meta")
+            item.set("property", property_name)
+            item.text = value
+    else:
+        for item in existing:
+            metadata_element.remove(item)
+
+
 def write_epub_metadata(epub_path: Path, title: str, author: str, source: str, tags: str, notes: str):
     opf_path = get_epub_opf_path(epub_path)
     temp_path = epub_path.with_suffix(epub_path.suffix + ".tmp")
@@ -684,6 +790,7 @@ def write_epub_metadata(epub_path: Path, title: str, author: str, source: str, t
         set_single_text(metadata, f"{{{DC_NS}}}creator", author)
         set_single_text(metadata, f"{{{DC_NS}}}source", source)
         set_single_text(metadata, f"{{{DC_NS}}}description", notes)
+        set_single_text(metadata, f"{{{DC_NS}}}language", "en")
 
         for subject in metadata.findall(f"{{{DC_NS}}}subject"):
             metadata.remove(subject)
@@ -711,6 +818,13 @@ def strip_xml_html_tags(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def strip_xml_html_tags_preserve_lines(text: str) -> str:
+    text = re.sub(r"<\s*(?:br|/p|/h[1-6]|/li|/div|/section|/nav)\b[^>]*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    lines = [re.sub(r"\s+", " ", html.unescape(line)).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
@@ -743,12 +857,123 @@ def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
     return "\n".join(chunks)[:max_chars]
 
 
+def read_text_from_epub_preserve_lines(epub_path: Path, max_chars: int = 50000) -> str:
+    chunks = []
+    try:
+        with zipfile.ZipFile(epub_path, "r") as archive:
+            names = archive.namelist()
+            text_names = [
+                name for name in names
+                if name.lower().endswith((".xhtml", ".html", ".htm", ".xml"))
+                and "nav" not in name.lower()
+                and "toc" not in name.lower()
+                and "container.xml" not in name.lower()
+            ]
+
+            for name in text_names[:80]:
+                try:
+                    decoded = archive.read(name).decode("utf-8", errors="ignore")
+                    cleaned = strip_xml_html_tags_preserve_lines(decoded)
+                    if cleaned:
+                        chunks.append(cleaned)
+                    if sum(len(chunk) for chunk in chunks) >= max_chars:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        return ""
+
+    return "\n".join(chunks)[:max_chars]
+
+
 def read_text_from_docx(docx_path: Path, max_chars: int = 50000) -> str:
     try:
         with zipfile.ZipFile(docx_path, "r") as archive:
             raw = archive.read("word/document.xml")
+        root = ET.fromstring(raw)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        paragraphs = []
+        for paragraph in root.findall(".//w:p", ns):
+            parts = []
+            for element in paragraph.iter():
+                tag = element.tag.rsplit("}", 1)[-1]
+                if tag == "t" and element.text:
+                    parts.append(element.text)
+                elif tag == "tab":
+                    parts.append(" ")
+                elif tag in {"br", "cr"}:
+                    parts.append("\n")
+            text = "".join(parts).strip()
+            if text:
+                paragraphs.append(text)
+            if sum(len(item) for item in paragraphs) >= max_chars:
+                break
+        if paragraphs:
+            return "\n\n".join(paragraphs)[:max_chars]
         decoded = raw.decode("utf-8", errors="ignore")
         return strip_xml_html_tags(decoded)[:max_chars]
+    except Exception:
+        return ""
+
+
+def read_text_from_legacy_doc(doc_path: Path, max_chars: int = 50000) -> str:
+    if not sys.platform.startswith("win") or not shutil.which("powershell"):
+        return ""
+
+    script = r"""
+$ErrorActionPreference = 'Stop'
+$path = $args[0]
+$maxChars = [int]$args[1]
+$word = $null
+$doc = $null
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    $doc = $word.Documents.Open($path, $false, $true, $false)
+    $text = [string]$doc.Content.Text
+    if ($text.Length -gt $maxChars) {
+        $text = $text.Substring(0, $maxChars)
+    }
+    [Console]::Write($text)
+}
+finally {
+    if ($doc -ne $null) {
+        $doc.Close($false) | Out-Null
+    }
+    if ($word -ne $null) {
+        $word.Quit() | Out-Null
+    }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="aelm_doc_extract_") as temp_folder:
+            script_path = Path(temp_folder) / "extract_doc_text.ps1"
+            script_path.write_text(script, encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script_path),
+                    str(doc_path),
+                    str(max_chars),
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=WINDOWS_NO_CONSOLE_FLAGS,
+                timeout=90,
+            )
+        if completed.returncode != 0:
+            return ""
+        return re.sub(r"\r\n?|\v|\f", "\n", completed.stdout or "")[:max_chars]
     except Exception:
         return ""
 
@@ -779,17 +1004,268 @@ def read_metadata_text_from_pdf(pdf_path: Path, max_chars: int = 12000) -> str:
     return "\n".join(lines)[:max_chars]
 
 
+def read_text_from_pdf(pdf_path: Path, max_chars: int = 50000) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
+
+    chunks = []
+    try:
+        reader = PdfReader(str(pdf_path))
+        metadata = reader.metadata or {}
+        for label, key in [
+            ("Title", "/Title"),
+            ("Author", "/Author"),
+            ("Subject", "/Subject"),
+            ("Keywords", "/Keywords"),
+        ]:
+            value = metadata.get(key)
+            if value:
+                chunks.append(f"{label}: {value}")
+
+        for page in reader.pages:
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
+            if page_text.strip():
+                chunks.append(page_text)
+            if sum(len(chunk) for chunk in chunks) >= max_chars:
+                break
+    except Exception:
+        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
+
+    text = "\n\n".join(chunks).strip()
+    if not text:
+        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
+    return text[:max_chars]
+
+
 def read_text_for_metadata_detection(path: Path, max_chars: int = 50000) -> str:
     suffix = path.suffix.lower()
     if suffix == ".epub":
         return read_text_from_epub(path, max_chars=max_chars)
     if suffix == ".docx":
         return read_text_from_docx(path, max_chars=max_chars)
+    if suffix == ".doc":
+        return read_text_from_legacy_doc(path, max_chars=max_chars)
     if suffix == ".pdf":
-        return read_metadata_text_from_pdf(path, max_chars=max_chars)
+        return read_text_from_pdf(path, max_chars=max_chars)
     if suffix in {".txt", ".rtf", ".html", ".htm"}:
         return read_text_from_plain_file(path, max_chars=max_chars)
     return ""
+
+
+def detect_language_from_text(text: str, default: str = "en") -> str:
+    sample = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' ]+", " ", text or "").casefold()
+    words = re.findall(r"[a-zÀ-ÖØ-öø-ÿ']+", sample[:200000])
+    if not words:
+        return default
+
+    word_set = set(words)
+    language_markers = {
+        "en": {"the", "and", "of", "to", "in", "that", "is", "for", "with", "as", "was", "are", "by", "from", "this"},
+        "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del"},
+        "fr": {"le", "la", "les", "de", "des", "que", "et", "en", "un", "une", "pour", "avec", "est", "dans", "du"},
+        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "für"},
+        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "è", "del", "della"},
+        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "é", "do", "da"},
+    }
+    scores = {}
+    for language, markers in language_markers.items():
+        scores[language] = sum(1 for marker in markers if marker in word_set)
+
+    best_language, best_score = max(scores.items(), key=lambda item: item[1])
+    if best_score < 3:
+        return default
+    return best_language
+
+
+def natural_sort_key(path: Path):
+    parts = re.split(r"(\d+)", path.name.casefold())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
+def book_part_sort_key(path: Path):
+    name = path.stem.casefold()
+    if re.search(r"(?:^|[_\-\s])fm(?:$|[_\-\s])", name):
+        section_rank = 0
+    elif re.search(r"(?:^|[_\-\s])em(?:$|[_\-\s])", name):
+        section_rank = 2
+    else:
+        section_rank = 1
+
+    chapter_match = re.search(r"(?:^|[_\-\s])ch(?:apter)?\s*0*(\d+)", name, flags=re.IGNORECASE)
+    chapter_number = int(chapter_match.group(1)) if chapter_match else 9999
+    return (section_rank, chapter_number, natural_sort_key(path))
+
+
+def page_id_for_label(page_label):
+    page_label = str(page_label or "").strip()
+    page_id = "page-" + re.sub(r"[^0-9A-Za-z]+", "-", page_label).strip("-").lower()
+    return page_id or "page"
+
+
+def parse_text_toc_entries(text: str, max_entries: int = 350):
+    lines = [clean_metadata_line(line) for line in re.split(r"[\r\n]+", text or "")]
+    lines = [line for line in lines if line]
+    start = None
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"(?:table of )?contents", line, flags=re.IGNORECASE):
+            start = index + 1
+            break
+    if start is None:
+        return []
+
+    entries = []
+    seen = set()
+    for line in lines[start:start + 900]:
+        if re.match(r"^(?:(?:p?age)\s+)+[0-9ivxlcdm]+\s*$", line, flags=re.IGNORECASE):
+            continue
+        normalized_line = re.sub(r"\s+", " ", line).strip()
+        match = re.match(
+            r"^(?P<title>.+?)(?:\.{2,}|\s{2,}|\s)(?P<page>[0-9]+|[ivxlcdm]+)\s*$",
+            normalized_line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        title = re.sub(r"\.{2,}", " ", match.group("title")).strip(" .\t")
+        title = re.sub(r"\s+", " ", title)
+        page_label = match.group("page").strip()
+        if len(title) < 3 or len(title) > 180:
+            continue
+        if title.casefold() in {"table of contents", "contents", "chapter", "part", "page"}:
+            continue
+        key = (title.casefold(), page_label.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({"title": title, "page": page_label, "page_id": page_id_for_label(page_label)})
+        if len(entries) >= max_entries:
+            break
+    return entries
+
+
+def looks_like_text_toc_entry_line(line: str):
+    normalized_line = re.sub(r"\s+", " ", line or "").strip()
+    if re.fullmatch(r"(?:table of )?contents", normalized_line, flags=re.IGNORECASE):
+        return True
+    match = re.match(
+        r"^(?P<title>.+?)(?:\.{2,}|\s{2,}|\s)(?P<page>[0-9]+|[ivxlcdm]+)\s*$",
+        normalized_line,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return False
+    title = re.sub(r"\.{2,}", " ", match.group("title")).strip(" .\t")
+    if len(title) < 3 or len(title) > 180:
+        return False
+    return title.casefold() not in {"chapter", "part", "page"}
+
+
+def looks_like_standalone_heading_line(line: str):
+    normalized = re.sub(r"\s+", " ", line or "").strip()
+    if not normalized:
+        return False
+    if len(normalized) > 140:
+        return False
+    if re.match(r"^(?:chapter|part|section|appendix|index|front matter)\b", normalized, flags=re.IGNORECASE):
+        return True
+    if re.match(r"^(?:§|Â§)+\s*\d+(?:\.\d+)*\.?\s+\S+", normalized):
+        return True
+    if re.match(r"^[A-Z][A-Z0-9 ,;:'’\-\(\)&]{5,}$", normalized) and len(normalized.split()) <= 12:
+        return True
+    return False
+
+
+def looks_like_heading_continuation_line(line: str):
+    normalized = re.sub(r"\s+", " ", line or "").strip()
+    if not normalized:
+        return False
+    if len(normalized) > 90:
+        return False
+    if normalized.endswith((".", "?", "!", ";", ":")):
+        return False
+    if re.search(r"\b(the|and|or|but|with|from|into|after|before|because|that|this|will|shall|must|have|has|was|were|are|is)\b", normalized, flags=re.IGNORECASE):
+        return False
+    return bool(re.match(r"^[A-Z0-9§Â§][A-Za-z0-9§Â§ ,'\u2019\-\(\)&:]+$", normalized))
+
+
+def is_blank_page_notice(line: str):
+    normalized = re.sub(r"\s+", " ", line or "").strip(" .;:-\t").casefold()
+    return normalized in {
+        "this page was intentionally left blank",
+        "this page intentionally left blank",
+        "intentionally left blank",
+        "blank page",
+    }
+
+
+def is_restricted_access_notice(line: str):
+    normalized = re.sub(r"\s+", " ", line or "").strip(" .;:-\t").casefold()
+    normalized = normalized.replace("\u2019", "'")
+    normalized = normalized.replace("publisher?s", "publisher's")
+    return normalized in {
+        "this document has been prepared exclusively for the use of a student with a print disability. it is protected by the publisher's original copyright. it may not be shared or transferred to any other person",
+        "this document has been prepared exclusively for the use of a student with a print disability it is protected by the publisher's original copyright it may not be shared or transferred to any other person",
+    }
+
+
+def is_import_boilerplate_line(line: str):
+    return is_blank_page_notice(line) or is_restricted_access_notice(line)
+
+
+def is_page_label_line(line: str):
+    line = re.sub(r"\s+", " ", line or "").strip()
+    if re.fullmatch(r"(?:(?:p?age)\s+)+([0-9ivxlcdm]+)", line, flags=re.IGNORECASE):
+        return True
+    if re.fullmatch(r"\d{1,4}", line):
+        return True
+    return False
+
+
+def page_label_from_line(line: str):
+    line = re.sub(r"\s+", " ", line or "").strip()
+    labeled = re.fullmatch(r"(?:(?:p?age)\s+)+([0-9ivxlcdm]+)", line, flags=re.IGNORECASE)
+    if labeled:
+        return labeled.group(1)
+    if re.fullmatch(r"\d{1,4}", line):
+        return line
+    return ""
+
+
+def cleaned_lines_for_reflow(text: str):
+    raw_lines = [line.strip() for line in re.sub(r"\r\n?", "\n", text or "").split("\n")]
+    nonempty = [re.sub(r"\s+", " ", line).strip() for line in raw_lines if line.strip()]
+    counts = {}
+    for line in nonempty:
+        key = line.casefold()
+        counts[key] = counts.get(key, 0) + 1
+
+    repeated = set()
+    for line in nonempty:
+        key = line.casefold()
+        if counts.get(key, 0) < 4:
+            continue
+        if len(line) > 120:
+            continue
+        if is_page_label_line(line) or looks_like_text_toc_entry_line(line):
+            continue
+        if re.match(r"^(chapter|part|section|appendix)\b", line, flags=re.IGNORECASE):
+            continue
+        repeated.add(key)
+
+    cleaned = []
+    removed = 0
+    for line in raw_lines:
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if normalized and (is_import_boilerplate_line(normalized) or normalized.casefold() in repeated):
+            removed += 1
+            continue
+        cleaned.append(line)
+    return cleaned, removed
 
 
 def clean_metadata_line(line: str) -> str:
@@ -819,6 +1295,95 @@ def is_bookshare_notice_line(line: str) -> bool:
     )
 
 
+def extract_isbn_from_text(text: str) -> str:
+    """Find a likely ISBN, including Word superscript/check-digit artifacts."""
+    if not text:
+        return ""
+
+    text = re.sub(r"[\u2010-\u2015]", "-", text)
+    labeled_patterns = [
+        r"\bISBN(?:-1[03])?[ \t]*:?[ \t]*([0-9Xx][0-9Xx \t\-\^\.]{8,35}[0-9Xx])",
+        r"\bISBN(?:-1[03])?[ \t]*:?[ \t]*((?:97[89][-\t ]?)?[0-9][0-9Xx \t\-\^\.]{8,35})",
+    ]
+    general_patterns = [
+        r"\b((?:97[89][-\s]?)?[0-9][-\s]?[0-9]{2,5}[-\s]?[0-9]{2,7}[-\s]?[0-9]{1,7}(?:[-\s\^]?[0-9Xx])?)\b",
+    ]
+
+    candidates = []
+    for pattern in labeled_patterns:
+        candidates.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+    for pattern in general_patterns:
+        candidates.extend(re.findall(pattern, text, flags=re.IGNORECASE))
+
+    fallback = ""
+    isbn10 = ""
+    for candidate in candidates:
+        cleaned = re.sub(r"[^0-9Xx]", "", candidate)
+        if len(cleaned) == 13:
+            return cleaned
+        if len(cleaned) == 10 and not isbn10:
+            isbn10 = cleaned
+        if not fallback and len(cleaned) in {9, 11, 12} and cleaned.startswith(("978", "979")):
+            fallback = cleaned
+    if isbn10:
+        return isbn10
+    return fallback
+
+
+def extract_publication_year_from_text(text: str, require_label: bool = False, include_copyright: bool = True) -> str:
+    if not text:
+        return ""
+
+    sample = text[:60000]
+    edition_match = re.search(
+        r"\b(19[5-9]\d|20[0-4]\d)(?:\s*[-/]\s*(?:19[5-9]\d|20[0-4]\d))?\s+(?:abridged\s+)?(?:edition|ed\.)\b",
+        sample,
+        flags=re.IGNORECASE,
+    )
+    if edition_match:
+        return edition_match.group(1)
+
+    labeled_patterns = [
+        r"\b(?:published|publication date|date of publication|publication year)\D{0,80}(19[5-9]\d|20[0-4]\d)",
+    ]
+    if include_copyright:
+        labeled_patterns.append(r"(?:\u00a9|\(c\)|copyright)\D{0,80}(19[5-9]\d|20[0-4]\d)")
+    for pattern in labeled_patterns:
+        match = re.search(pattern, sample, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    if require_label:
+        return ""
+
+    match = re.search(r"\b(19[5-9]\d|20[0-4]\d)\b", sample, flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def extract_publisher_from_text(text: str) -> str:
+    if not text:
+        return ""
+
+    sample = text[:60000]
+    patterns = [
+        r"(?:\u00a9|\(c\)|copyright)\s*(?:19[5-9]\d|20[0-4]\d)\s+([^\r\n]{2,80})",
+        r"\bpublished by\s+([^\r\n]{2,100})",
+        r"\bpublisher\s*[:\-]\s*([^\r\n]{2,100})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, sample, flags=re.IGNORECASE)
+        if not match:
+            continue
+        publisher = clean_metadata_line(match.group(1))
+        publisher = clean_publisher_value(publisher)
+        if looks_like_publisher(publisher):
+            return publisher
+
+    if re.search(r"\bA\s+Thomson\s+Reuters\s+business\b", sample, flags=re.IGNORECASE):
+        return "Thomson Reuters"
+    return ""
+
+
 def clean_filename_title(path: Path) -> str:
     title = path.stem
     title = re.sub(r"[_]+", " ", title)
@@ -844,6 +1409,9 @@ def clean_author_value(value: str) -> str:
     value = re.sub(r"^(?:by|author|authors|written by|edited by)\s*[:\-]?\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+(?:narrated by|read by|bookshare|copyright|all rights reserved).*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+", " ", value).strip(" .;,")
+    if value.isupper() and len(value.split()) <= 8:
+        value = value.title()
+        value = re.sub(r"\b([A-Z])\.", lambda match: match.group(1).upper() + ".", value)
     return value
 
 
@@ -852,6 +1420,156 @@ def clean_title_value(value: str) -> str:
     value = re.sub(r"^(?:title|book title)\s*[:\-]?\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+", " ", value).strip(" .;,")
     return value
+
+
+def title_words(value: str) -> list[str]:
+    return [
+        word.casefold()
+        for word in re.findall(r"[A-Za-z][A-Za-z0-9']+", value or "")
+        if len(word) > 2
+    ]
+
+
+def has_useful_filename_title(path: Path) -> bool:
+    words = title_words(clean_filename_title(path))
+    return len(words) >= 2
+
+
+def looks_like_machine_pdf_title(value: str) -> bool:
+    title = clean_title_value(value)
+    if not title:
+        return True
+
+    lower = title.casefold()
+    if re.search(r"\.(?:pdf|docx?|rtf|txt|epub)$", lower):
+        return True
+    if re.search(r"\b[a-z]\d{3,}\b", lower) or re.search(r"\b\d{4,}\b", lower):
+        return True
+
+    words = title_words(title)
+    if not words:
+        return True
+
+    short_words = [word for word in words if len(word) <= 4]
+    if len(words) >= 4 and len(short_words) / len(words) >= 0.75 and re.search(r"\d", title):
+        return True
+
+    machine_terms = {"matls", "contr", "ch", "fm", "em", "cb", "a012636"}
+    if any(word in machine_terms for word in words):
+        return True
+
+    return False
+
+
+def looks_like_boilerplate_title(value: str) -> bool:
+    lower = clean_title_value(value).casefold()
+    if not lower:
+        return True
+    if lower in {"published", "copyright", "contents", "table of contents", "chapter", "page"}:
+        return True
+    boilerplate = [
+        "all rights reserved",
+        "paragraph",
+        "several pages",
+        "photocopy",
+        "recording",
+        "licensed to",
+        "permission",
+        "publisher",
+        "excerpted material",
+        "reprinted by permission",
+        "appearing in this book",
+        "evaluation for use",
+        "third persons",
+        "respect for rights",
+    ]
+    if re.match(r"^\d+(?:\.\d+)+\s+", lower):
+        return True
+    return any(fragment in lower for fragment in boilerplate)
+
+
+def title_candidate_matches_filename(candidate: str, path: Path) -> bool:
+    filename_words = set(title_words(clean_filename_title(path)))
+    candidate_words = set(title_words(candidate))
+    if not filename_words or not candidate_words:
+        return False
+    overlap = filename_words & candidate_words
+    needed = min(2, len(candidate_words), len(filename_words))
+    return len(overlap) >= needed
+
+
+def looks_like_useful_title_candidate(candidate: str, path: Path, prefer_filename: bool = False) -> bool:
+    candidate = clean_title_value(candidate)
+    if len(candidate) < 4 or looks_like_boilerplate_title(candidate):
+        return False
+
+    words = title_words(candidate)
+    if len(words) > 18:
+        return False
+
+    if prefer_filename:
+        if looks_like_machine_pdf_title(candidate):
+            return False
+        if has_useful_filename_title(path) and not title_candidate_matches_filename(candidate, path):
+            return False
+
+    return True
+
+
+def should_replace_title(current_title: str, candidate: str, path: Path, prefer_filename: bool = False) -> bool:
+    if not looks_like_useful_title_candidate(candidate, path, prefer_filename=prefer_filename):
+        return False
+    if not current_title:
+        return True
+    if prefer_filename and has_useful_filename_title(path) and not is_weak_title(current_title, path):
+        return False
+    return is_weak_title(current_title, path)
+
+
+def title_page_candidate(lines: list[str], path: Path) -> str:
+    filename_words = set(title_words(clean_filename_title(path)))
+    for line in lines[:12]:
+        candidate = clean_title_value(line)
+        if not looks_like_useful_title_candidate(candidate, path, prefer_filename=False):
+            continue
+        candidate_words = set(title_words(candidate))
+        if filename_words and filename_words.issubset(candidate_words):
+            return candidate.title() if candidate.isupper() else candidate
+    return ""
+
+
+def clean_publisher_value(value: str) -> str:
+    value = clean_metadata_line(value)
+    value = re.sub(r"^(?:publisher|published by|imprint)\s*[:\-]?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:copyright|\(c\)|\u00a9)\s*(?:[a-z]\s*)?(?:19[5-9]\d|20[0-4]\d)(?:\s*,\s*(?:19[5-9]\d|20[0-4]\d))*\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:[,;]\s*)?(?:19[5-9]\d|20[0-4]\d)(?:\s*,\s*(?:19[5-9]\d|20[0-4]\d))*\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"[\s.]+(?:all rights.*|printed in .*)$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip(" .;,")
+    return value
+
+
+def looks_like_publisher(value: str) -> bool:
+    if not value:
+        return False
+    lower = value.casefold()
+    if len(value) > 120:
+        return False
+    if any(fragment in lower for fragment in [
+        " across the street ", " friend", " gun", " saw ", " pages are indicated",
+        "law school", "advisory board", "created this publication", "accurate and authoritative",
+        "particular jurisdiction", "does not render", "professional advice",
+        "reprinted by permission", " by permission", "excerpted material",
+    ]):
+        return False
+    if value.rstrip().endswith("-"):
+        return False
+    publisher_pattern = (
+        r"\b(?:press|publishing|publisher|publishers|books|house|pearson|mcgraw|"
+        r"cengage|wiley|openstax|scholastic|harper|penguin|simon|houghton|"
+        r"macmillan|oxford|cambridge|west|aspen|wolters|kluwer|lexisnexis)\b"
+        r"|random house|thomson reuters|matthew bender|carolina academic"
+    )
+    return bool(re.search(publisher_pattern, lower, flags=re.IGNORECASE))
 
 
 def labeled_value(line: str, labels: list[str]) -> str:
@@ -879,10 +1597,31 @@ def looks_like_author(value: str) -> bool:
     if not value:
         return False
     lower = value.lower()
-    if any(word in lower for word in ["chapter", "contents", "copyright", "isbn", "publisher", "bookshare"]):
+    blocked_fragments = [
+        "chapter", "contents", "copyright", "isbn", "publisher", "bookshare",
+        "licensed to", "persons licensed", "all rights reserved", "photocopy",
+        "recording", "permission", "ellipsis", "several pages", "one of",
+        "any means", "electronic or mechanical", "co-conspirators",
+        "third persons", "evaluation for use", "respect for rights",
+    ]
+    if any(fragment in lower for fragment in blocked_fragments):
         return False
     words = [word for word in re.split(r"\s+", value) if word]
-    return 1 <= len(words) <= 8 and len(value) <= 120
+    if not 1 <= len(words) <= 8 or len(value) > 120:
+        return False
+    if lower.endswith(":") or re.search(r"(?<!\b[A-Z])\.(?!\s*[A-Z]\b)", value):
+        return False
+    if value[:1].islower():
+        return False
+    if re.fullmatch(r"[A-Z\s:.'-]+", value) and (len(words) <= 1 or value.rstrip().endswith(":") or value.casefold() in {"the court"}):
+        return False
+    if len(words) == 1 and not re.search(r"[A-Z][a-z]+", value):
+        return False
+
+    name_signal = bool(re.search(r"\b[A-Z]\.", value)) or len(re.findall(r"\b[A-Z][a-zA-Z'.-]+\b", value)) >= 2
+    if not name_signal:
+        return False
+    return True
 
 
 def fetch_json(url: str, timeout: int = 12) -> dict:
@@ -1030,18 +1769,32 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             if epub_metadata.get(key):
                 result[key] = epub_metadata[key]
 
+    prefer_filename_title = path.suffix.lower() in {".pdf", ".docx", ".doc"}
     text = read_text_for_metadata_detection(path)
     lines = [clean_metadata_line(line) for line in re.split(r"[\r\n]+", text)]
-    lines = [line for line in lines if line and len(line) < 240 and not is_bookshare_notice_line(line)]
+    lines = [
+        line for line in lines
+        if line and len(line) < 240 and not is_bookshare_notice_line(line) and not is_import_boilerplate_line(line)
+    ]
 
     filename_title = clean_filename_title(path)
-    if is_weak_title(result["title"], path):
+    if (
+        is_weak_title(result["title"], path)
+        or (prefer_filename_title and looks_like_machine_pdf_title(result["title"]) and has_useful_filename_title(path))
+    ):
         result["title"] = filename_title
+
+    if prefer_filename_title:
+        front_title = title_page_candidate(lines, path)
+        if front_title:
+            result["title"] = front_title
 
     # Look harder for labeled Bookshare/front-matter fields.
     title_value = line_after_label(lines, ["title", "book title", "name"], max_index=180)
-    if title_value and is_weak_title(result["title"], path):
-        result["title"] = clean_title_value(title_value)
+    if title_value:
+        candidate = clean_title_value(title_value)
+        if should_replace_title(result["title"], candidate, path, prefer_filename=prefer_filename_title):
+            result["title"] = candidate
 
     author_value = line_after_label(
         lines,
@@ -1069,7 +1822,7 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             if pattern.startswith("^(.+?)"):
                 possible_title = clean_title_value(match.group(1))
                 possible_author = clean_author_value(match.group(2))
-                if is_weak_title(result["title"], path) and possible_title:
+                if should_replace_title(result["title"], possible_title, path, prefer_filename=prefer_filename_title):
                     result["title"] = possible_title
             else:
                 possible_author = clean_author_value(match.group(1))
@@ -1084,7 +1837,7 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
         match = re.match(r"^(?:title|book title)[:\s]+(.+)$", line, flags=re.IGNORECASE)
         if match:
             candidate = clean_title_value(match.group(1))
-            if candidate:
+            if should_replace_title(result["title"], candidate, path, prefer_filename=prefer_filename_title):
                 result["title"] = candidate
             break
 
@@ -1093,10 +1846,12 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
         "bookshare", "copyright", "all rights reserved", "dedication",
         "contents", "table of contents", "chapter", "isbn", "published"
     ]
-    if is_weak_title(result["title"], path):
+    if not result["title"]:
         for line in lines[:100]:
             lower = line.lower()
             if len(line) < 4:
+                continue
+            if is_import_boilerplate_line(line):
                 continue
             if any(word in lower for word in boilerplate_words):
                 continue
@@ -1110,25 +1865,16 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
 
     # ISBN, year, publisher, and edition guesses.
     if text and not result.get("isbn"):
-        isbn_matches = re.findall(
-            r"\b(?:ISBN(?:-1[03])?:?\s*)?((?:97[89][-\s]?)?\d[-\s]?\d{2,5}[-\s]?\d{2,7}[-\s]?\d{1,7}[-\s]?[\dXx])\b",
-            text,
-            flags=re.IGNORECASE,
-        )
-        for isbn in isbn_matches:
-            cleaned_isbn = re.sub(r"[^0-9Xx]", "", isbn)
-            if len(cleaned_isbn) in {10, 13}:
-                result["isbn"] = cleaned_isbn
-                break
+        result["isbn"] = extract_isbn_from_text(text)
 
-    if text and not result.get("year"):
-        year_match = re.search(
-            r"\b(?:copyright|published|publication date|date|year)?\s*(19[5-9]\d|20[0-4]\d)\b",
-            text[:12000],
-            flags=re.IGNORECASE,
+    if text:
+        text_year = extract_publication_year_from_text(
+            text,
+            require_label=prefer_filename_title or bool(result.get("year")),
+            include_copyright=not prefer_filename_title,
         )
-        if year_match:
-            result["year"] = year_match.group(1)
+        if text_year:
+            result["year"] = text_year
 
     if text and not result.get("publisher"):
         publisher_value = line_after_label(
@@ -1137,11 +1883,16 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             max_index=220,
         )
         if publisher_value:
-            result["publisher"] = clean_metadata_line(publisher_value)
+            cleaned_publisher = clean_publisher_value(publisher_value)
+            if looks_like_publisher(cleaned_publisher):
+                result["publisher"] = cleaned_publisher
+        if not result.get("publisher"):
+            result["publisher"] = extract_publisher_from_text(text)
         if not result.get("publisher"):
             for line in lines[:180]:
-                if re.search(r"\b(press|publishing|publishers|books|house|pearson|mcgraw|cengage|wiley|openstax|scholastic|harper|penguin|random house|simon|houghton|macmillan|oxford|cambridge)\b", line, flags=re.IGNORECASE):
-                    result["publisher"] = line
+                cleaned_publisher = clean_publisher_value(line)
+                if looks_like_publisher(cleaned_publisher):
+                    result["publisher"] = cleaned_publisher
                     break
 
     if text and not result.get("edition"):
@@ -1152,6 +1903,10 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             if result.get("edition"):
                 break
             match = re.search(r"\b(\d+(?:st|nd|rd|th)\s+edition|first edition|second edition|third edition|fourth edition|fifth edition|sixth edition|seventh edition|eighth edition|ninth edition|tenth edition|revised edition|international edition|teacher'?s edition|student edition)\b", line, flags=re.IGNORECASE)
+            if match:
+                result["edition"] = clean_metadata_line(match.group(1))
+                break
+            match = re.search(r"\b((?:19[5-9]\d|20[0-4]\d)(?:\s*[-/]\s*(?:19[5-9]\d|20[0-4]\d))?\s+(?:abridged\s+)?edition)\b", line, flags=re.IGNORECASE)
             if match:
                 result["edition"] = clean_metadata_line(match.group(1))
                 break
@@ -1187,6 +1942,96 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
         result["tags"] = ", ".join(deduped_tags)
 
     # Do not auto-fill notes. Notes remain available for manual editing only.
+    return result
+
+
+def detect_metadata_from_text_content(text: str, existing: dict | None = None) -> dict:
+    existing = existing or {}
+    result = {
+        "title": existing.get("title", ""),
+        "author": existing.get("author", ""),
+        "source": existing.get("source", ""),
+        "tags": existing.get("tags", ""),
+        "notes": existing.get("notes", ""),
+        "edition": existing.get("edition", ""),
+        "year": existing.get("year", ""),
+        "isbn": existing.get("isbn", ""),
+        "publisher": existing.get("publisher", ""),
+    }
+
+    lines = [clean_metadata_line(line) for line in re.split(r"[\r\n]+", text or "")]
+    lines = [
+        line for line in lines
+        if line and len(line) < 240 and not is_bookshare_notice_line(line) and not is_import_boilerplate_line(line)
+    ]
+
+    title_value = line_after_label(lines, ["title", "book title", "name"], max_index=180)
+    if title_value:
+        result["title"] = clean_title_value(title_value)
+
+    author_value = line_after_label(
+        lines,
+        ["author", "authors", "creator", "creators", "by", "written by"],
+        max_index=220,
+    )
+    if author_value:
+        cleaned_author = clean_author_value(author_value)
+        if looks_like_author(cleaned_author):
+            result["author"] = cleaned_author
+
+    if not result["author"]:
+        for line in lines[:160]:
+            match = re.match(r"^by\s+(.+)$", line, flags=re.IGNORECASE)
+            if match:
+                cleaned_author = clean_author_value(match.group(1))
+                if looks_like_author(cleaned_author):
+                    result["author"] = cleaned_author
+                    break
+
+    if not result["title"]:
+        for line in lines[:100]:
+            lower = line.lower()
+            if len(line) < 4 or lower.startswith("by "):
+                continue
+            if is_import_boilerplate_line(line):
+                continue
+            if any(word in lower for word in ["bookshare", "copyright", "contents", "table of contents", "chapter", "isbn", "published"]):
+                continue
+            result["title"] = clean_title_value(line)
+            break
+
+    if text and not result.get("isbn"):
+        result["isbn"] = extract_isbn_from_text(text)
+
+    if text:
+        text_year = extract_publication_year_from_text(text, require_label=bool(result.get("year")))
+        if text_year:
+            result["year"] = text_year
+
+    if text and not result.get("publisher"):
+        publisher_value = line_after_label(lines, ["publisher", "published by", "imprint"], max_index=220)
+        if publisher_value:
+            cleaned_publisher = clean_publisher_value(publisher_value)
+            if looks_like_publisher(cleaned_publisher):
+                result["publisher"] = cleaned_publisher
+        if not result.get("publisher"):
+            result["publisher"] = extract_publisher_from_text(text)
+
+    if text and not result.get("edition"):
+        edition_value = line_after_label(lines, ["edition"], max_index=220)
+        if edition_value:
+            result["edition"] = clean_metadata_line(edition_value)
+        for line in lines[:180]:
+            if result.get("edition"):
+                break
+            match = re.search(r"\b(\d+(?:st|nd|rd|th)\s+edition|first edition|second edition|third edition|fourth edition|fifth edition|sixth edition|seventh edition|eighth edition|ninth edition|tenth edition|revised edition|international edition|teacher'?s edition|student edition)\b", line, flags=re.IGNORECASE)
+            if match:
+                result["edition"] = clean_metadata_line(match.group(1))
+                break
+
+    if not result["source"]:
+        result["source"] = "Bookshare" if "bookshare" in (text or "").lower() else "Personal"
+
     return result
 
 
@@ -1842,11 +2687,14 @@ class LibraryApp:
         self.filter_tag = ""
         self.filter_format = ""
         self.backup_check_after = None
+        self.watched_scan_after = None
+        self.watched_scan_running = False
 
         self.build_menu()
         self.build_ui()
         self.refresh_books()
         self.schedule_backup_check(5000)
+        self.schedule_watched_folder_scan(15000)
         self.root.after(750, self.import_command_line_files)
 
     def build_menu(self):
@@ -1859,6 +2707,7 @@ class LibraryApp:
         file_menu.add_command(label="Export Book Copy...\tCtrl+E", command=self.export_book)
         send_to_menu = Menu(file_menu, tearoff=False)
         send_to_menu.add_command(label="Voice Dream...\tCtrl+Shift+V", command=self.send_to_voice_dream)
+        send_to_menu.add_command(label="Dolphin EasyReader...", command=self.send_to_dolphin_easyreader)
         send_to_menu.add_command(label="Kindle...\tCtrl+Shift+K", command=self.send_to_kindle)
         send_to_menu.add_command(label="NLS eReader...\tCtrl+Shift+E", command=self.send_to_nls_ereader)
         send_to_menu.add_command(label="HumanWare Braille eReader (MTP)...", command=self.send_to_humanware_mtp)
@@ -1870,7 +2719,12 @@ class LibraryApp:
         book_menu = Menu(menu_bar, tearoff=False)
         book_menu.add_command(label="Edit Metadata...\tF2", command=self.edit_book)
         book_menu.add_command(label="Auto-Detect Metadata...\tCtrl+D", command=self.auto_detect_selected_metadata)
-        book_menu.add_command(label="Check EPUB Accessibility Metadata...", command=self.check_selected_epub_accessibility)
+        repair_menu = Menu(book_menu, tearoff=False)
+        repair_menu.add_command(label="Check EPUB Accessibility Metadata...", command=self.check_selected_epub_accessibility)
+        repair_menu.add_command(label="Add EPUB Page Breaks from Page Labels...", command=self.add_page_breaks_to_selected_epub)
+        repair_menu.add_command(label="Rebuild EPUB Table of Contents from Text TOC...", command=self.rebuild_selected_epub_toc_from_text)
+        repair_menu.add_command(label="Clean Repaired EPUB Text...", command=self.clean_selected_epub_text)
+        book_menu.add_cascade(label="Repair", menu=repair_menu)
         book_menu.add_command(label="Look Up Metadata Online...", command=self.lookup_selected_metadata_online)
         book_menu.add_command(label="View Cover Image...", command=self.view_selected_cover_image)
         book_menu.add_command(label="Convert to EPUB...\tCtrl+R", command=self.convert_selected_to_epub)
@@ -1951,6 +2805,14 @@ class LibraryApp:
         backup_menu.add_command(label="Show Backup Status", command=self.show_backup_status)
         settings_menu.add_cascade(label="Library Backup", menu=backup_menu)
         settings_menu.add_separator()
+        watch_menu = Menu(settings_menu, tearoff=False)
+        watch_menu.add_command(label="Add Watched Folder...", command=self.add_watched_folder)
+        watch_menu.add_command(label="Remove Watched Folder...", command=self.remove_watched_folder)
+        watch_menu.add_command(label="Scan Watched Folders Now", command=self.scan_watched_folders_now)
+        watch_menu.add_command(label="Toggle Automatic Watched Folder Scanning", command=self.toggle_watched_folder_auto_scan)
+        watch_menu.add_command(label="Show Watched Folder Status", command=self.show_watched_folder_status)
+        settings_menu.add_cascade(label="Watched Folders", menu=watch_menu)
+        settings_menu.add_separator()
         explorer_menu = Menu(settings_menu, tearoff=False)
         explorer_menu.add_command(label="Add File Explorer Right-Click Command", command=self.install_file_explorer_context_menu)
         explorer_menu.add_command(label="Remove File Explorer Right-Click Command", command=self.remove_file_explorer_context_menu)
@@ -1958,6 +2820,7 @@ class LibraryApp:
         settings_menu.add_cascade(label="File Explorer Integration", menu=explorer_menu)
         settings_menu.add_separator()
         settings_menu.add_command(label="Set Voice Dream Loader Folder...", command=self.choose_voice_dream_folder)
+        settings_menu.add_command(label="Set Dolphin EasyReader Folder...", command=self.choose_dolphin_easyreader_folder)
         settings_menu.add_command(label="Set NLS eReader Folder...", command=self.choose_nls_ereader_folder)
         settings_menu.add_command(label="Set Kindle Email Addresses...", command=self.set_kindle_email)
         settings_menu.add_command(label="Set Default Ebook Reader...", command=self.choose_default_reader)
@@ -2018,6 +2881,8 @@ class LibraryApp:
         self.book_list.bind("<Control-A>", lambda event: self.deselect_all_books())
         self.book_list.bind("<Control-space>", self.toggle_mark_current_book)
         self.book_list.bind("<Escape>", self.clear_search_from_keyboard)
+        self.book_list.bind("<Home>", self.move_to_first_book)
+        self.book_list.bind("<End>", self.move_to_last_book)
         self.bind_alt_number_shortcuts(self.book_list)
         self.book_list.bind("<<ListboxSelect>>", self.on_book_list_select)
         self.book_list.bind("<KeyPress>", self.on_book_list_keypress)
@@ -2048,6 +2913,13 @@ class LibraryApp:
         )
         self.shortcut_readout.pack(fill=X, pady=(8, 0))
         self.bind_alt_number_shortcuts(self.shortcut_readout)
+        self.shortcut_readout.bind("<Up>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<Down>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<Prior>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<Next>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<Home>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<End>", self.return_to_book_list_from_readout)
+        self.shortcut_readout.bind("<Escape>", self.return_to_book_list_from_readout)
 
         status = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status.pack(fill=X, pady=(8, 0))
@@ -2440,25 +3312,61 @@ class LibraryApp:
             return
         self.status_var.set(text)
         try:
-            selected_index = self.current_book_index()
+            selected_index = self.current_book_index_quiet()
             self.shortcut_readout_var.set(text)
             self.shortcut_readout.focus_force()
             self.shortcut_readout.selection_range(0, END)
             self.shortcut_readout.icursor(END)
             if self.shortcut_readout_return_after is not None:
                 self.root.after_cancel(self.shortcut_readout_return_after)
-            self.shortcut_readout_return_after = self.root.after(
-                1600,
-                lambda index=selected_index: self.return_focus_from_shortcut_readout(index),
-            )
+                self.shortcut_readout_return_after = None
         except Exception:
             pass
+
+    def return_to_book_list_from_readout(self, event=None):
+        selected_index = self.current_book_index_quiet()
+        self.return_focus_from_shortcut_readout(selected_index)
+        if event and event.keysym in {"Up", "Down", "Prior", "Next", "Home", "End"}:
+            self.root.after(1, lambda keysym=event.keysym: self.move_book_list_after_readout(keysym))
+        return "break"
+
+    def move_book_list_after_readout(self, keysym):
+        if self.book_list.size() == 0:
+            return
+        index = self.current_book_index_quiet()
+        if index is None:
+            index = 0
+        if keysym == "Up":
+            index -= 1
+        elif keysym == "Down":
+            index += 1
+        elif keysym == "Prior":
+            index -= 10
+        elif keysym == "Next":
+            index += 10
+        elif keysym == "Home":
+            index = 0
+        elif keysym == "End":
+            index = self.book_list.size() - 1
+        self.select_book_list_index(index)
 
     def return_focus_from_shortcut_readout(self, selected_index=None):
         self.shortcut_readout_return_after = None
         try:
             if self.root.focus_get() == self.shortcut_readout:
-                self.settle_book_list_focus(selected_index)
+                if self.book_list.size() == 0:
+                    self.book_list.focus_set()
+                    return
+                if selected_index is None:
+                    selected_index = self.current_book_index()
+                if selected_index is None:
+                    selected_index = 0
+                selected_index = max(0, min(selected_index, self.book_list.size() - 1))
+                self.book_list.selection_clear(0, END)
+                self.book_list.selection_set(selected_index)
+                self.book_list.activate(selected_index)
+                self.book_list.see(selected_index)
+                self.book_list.focus_set()
         except Exception:
             pass
 
@@ -2539,6 +3447,12 @@ class LibraryApp:
             return None, None, None
         return folder, folder / "library_backup.db", folder / "library_backup_manifest.json"
 
+    def backup_books_folder(self):
+        folder = self.backup_folder()
+        if not folder:
+            return None
+        return folder / BOOKS_FOLDER
+
     def detected_cloud_folder(self, service):
         home = Path.home()
         if service == "onedrive":
@@ -2580,7 +3494,7 @@ class LibraryApp:
         if detected:
             use_detected = messagebox.askyesno(
                 "Use detected cloud folder?",
-                f"I found this {label} folder:\n\n{detected}\n\nUse it for library database backups?"
+                f"I found this {label} folder:\n\n{detected}\n\nUse it for library database and book file backups?"
             )
             if use_detected:
                 folder = detected
@@ -2609,7 +3523,7 @@ class LibraryApp:
         self.status_var.set(f"Library backup folder set to {backup_folder}.")
         messagebox.showinfo(
             "Library Backup",
-            f"Backups will be saved here:\n\n{backup_folder}\n\nSet a schedule or choose Back Up Now from Settings, Library Backup."
+            f"Backups will be saved here:\n\n{backup_folder}\n\nThe backup includes the library metadata database and the imported book files. Set a schedule or choose Back Up Now from Settings, Library Backup."
         )
         self.schedule_backup_check(1000)
 
@@ -2646,7 +3560,12 @@ class LibraryApp:
             return True
         db_mtime = str(self.db.db_path.stat().st_mtime)
         backed_mtime = self.db.get_setting("last_backup_db_mtime", "")
-        return db_mtime != backed_mtime and datetime.utcnow() - last_backup >= interval
+        books_folder = self.db.books_path
+        book_file_count, book_byte_count = folder_file_stats(books_folder)
+        backed_book_signature = self.db.get_setting("last_backup_books_signature", "")
+        book_signature = f"{book_file_count}:{book_byte_count}"
+        changed = db_mtime != backed_mtime or book_signature != backed_book_signature
+        return changed and datetime.utcnow() - last_backup >= interval
 
     def schedule_backup_check(self, delay_ms=None):
         if self.backup_check_after is not None:
@@ -2679,43 +3598,56 @@ class LibraryApp:
 
     def backup_library_now(self, automatic=False):
         folder, backup_file, manifest_file = self.backup_paths()
+        backup_books_folder = self.backup_books_folder()
         if not folder:
             if automatic:
                 return
             messagebox.showinfo(
                 "Choose a backup folder",
-                "Choose a Google Drive, OneDrive, iCloud Drive, or other synced folder before backing up."
+                "Choose a Google Drive, OneDrive, iCloud Drive, or other synced folder before backing up the library database and imported book files."
             )
             self.choose_cloud_backup_folder("other")
             folder, backup_file, manifest_file = self.backup_paths()
+            backup_books_folder = self.backup_books_folder()
             if not folder:
                 return
 
         try:
             folder.mkdir(parents=True, exist_ok=True)
             self.db.backup_to(backup_file)
+            sync_folder_contents(self.db.books_path, backup_books_folder)
             db_mtime = str(self.db.db_path.stat().st_mtime)
             book_count = self.db.connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            book_file_count, book_byte_count = folder_file_stats(self.db.books_path)
+            backup_file_count, backup_byte_count = folder_file_stats(backup_books_folder)
+            book_signature = f"{book_file_count}:{book_byte_count}"
             manifest = {
                 "app": APP_NAME,
                 "created_at": utc_now_text(),
                 "source_database": str(self.db.db_path),
                 "backup_database": str(backup_file),
+                "source_books_folder": str(self.db.books_path),
+                "backup_books_folder": str(backup_books_folder),
                 "source_database_mtime": db_mtime,
                 "book_count": book_count,
+                "book_file_count": book_file_count,
+                "book_byte_count": book_byte_count,
+                "backup_book_file_count": backup_file_count,
+                "backup_book_byte_count": backup_byte_count,
             }
             manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             self.db.set_setting("last_backup_at", manifest["created_at"])
             self.db.set_setting("last_backup_db_mtime", db_mtime)
+            self.db.set_setting("last_backup_books_signature", book_signature)
             self.db.set_setting("last_seen_backup_file_mtime", str(backup_file.stat().st_mtime))
-            message = f"Library database backed up to {backup_file}."
+            message = f"Library database and {backup_file_count} book file{'s' if backup_file_count != 1 else ''} backed up to {folder}."
             self.status_var.set(message)
             if not automatic:
                 messagebox.showinfo("Library Backup Complete", message)
         except Exception as exc:
             self.status_var.set("Library backup failed.")
             if not automatic:
-                messagebox.showerror("Library Backup Failed", f"Could not back up the library database.\n\n{exc}")
+                messagebox.showerror("Library Backup Failed", f"Could not back up the library database and imported book files.\n\n{exc}")
 
     def backup_file_is_valid(self, backup_file):
         try:
@@ -2730,12 +3662,28 @@ class LibraryApp:
         except Exception:
             return False
 
+    def repair_restored_stored_paths(self):
+        rows = self.db.connection.execute("SELECT id, stored_path FROM books").fetchall()
+        for book_id, stored_path in rows:
+            filename = Path(stored_path or "").name
+            if not filename:
+                continue
+            restored_path = self.db.books_path / filename
+            if restored_path.exists() and str(restored_path) != stored_path:
+                self.db.connection.execute(
+                    "UPDATE books SET stored_path = ?, format = ? WHERE id = ?",
+                    (str(restored_path), restored_path.suffix.lower().lstrip("."), book_id),
+                )
+        self.db.connection.commit()
+
     def restore_library_backup(self):
         folder, backup_file, _manifest_file = self.backup_paths()
+        backup_books_folder = self.backup_books_folder()
         if not folder:
             messagebox.showinfo("Choose a backup folder", "Choose a backup folder before restoring.")
             self.choose_cloud_backup_folder("other")
             folder, backup_file, _manifest_file = self.backup_paths()
+            backup_books_folder = self.backup_books_folder()
             if not folder:
                 return
         if not backup_file.exists():
@@ -2745,10 +3693,20 @@ class LibraryApp:
             messagebox.showerror("Backup file not valid", "The backup file does not look like an Accessible Ebook Library Manager database.")
             return
 
+        books_backup_available = backup_books_folder and backup_books_folder.exists() and backup_books_folder.is_dir()
+        restore_scope = (
+            "the cloud backup over the current local library database and imported book files"
+            if books_backup_available
+            else "the cloud backup over the current local library database"
+        )
+        books_note = (
+            "The current local database and Books folder will be saved as safety copies first."
+            if books_backup_available
+            else "This backup does not include a Books folder, so only the database will be restored. The current local database will be saved as a safety copy first."
+        )
         if not messagebox.askyesno(
             "Restore Library Backup",
-            "Restore the cloud backup over the current local library database?\n\n"
-            "The current local database will be saved as a safety copy first."
+            f"Restore {restore_scope}?\n\n{books_note}"
         ):
             self.focus_books_list()
             return
@@ -2756,17 +3714,30 @@ class LibraryApp:
         preserved_folder = self.db.get_setting("backup_folder", "")
         preserved_schedule = self.db.get_setting("backup_schedule", DEFAULT_BACKUP_SCHEDULE)
         safety_copy = self.db.folder / f"library_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        safety_books_folder = self.db.folder / f"{BOOKS_FOLDER}_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         try:
             self.db.connection.commit()
             shutil.copy2(self.db.db_path, safety_copy)
+            if books_backup_available and self.db.books_path.exists():
+                sync_folder_contents(self.db.books_path, safety_books_folder)
             self.db.close()
             shutil.copy2(backup_file, self.db.db_path)
             self.db = LibraryDatabase()
+            if books_backup_available:
+                replace_folder_from_backup(backup_books_folder, self.db.books_path)
+                self.repair_restored_stored_paths()
             self.db.set_setting("backup_folder", preserved_folder)
             self.db.set_setting("backup_schedule", preserved_schedule)
             self.refresh_books()
             self.settle_book_list_focus()
-            message = f"Library restored from backup. Safety copy saved at {safety_copy}."
+            if books_backup_available:
+                restored_file_count, _restored_bytes = folder_file_stats(self.db.books_path)
+                message = (
+                    f"Library database and {restored_file_count} book file{'s' if restored_file_count != 1 else ''} restored from backup. "
+                    f"Safety copies saved at {safety_copy} and {safety_books_folder}."
+                )
+            else:
+                message = f"Library database restored from backup. Safety copy saved at {safety_copy}."
             self.status_var.set(message)
             messagebox.showinfo("Library Restored", message)
         except Exception as exc:
@@ -2778,16 +3749,312 @@ class LibraryApp:
 
     def show_backup_status(self):
         folder, backup_file, manifest_file = self.backup_paths()
+        backup_books_folder = self.backup_books_folder()
         manifest = self.backup_manifest()
+        current_backup_book_count, current_backup_book_bytes = folder_file_stats(backup_books_folder) if backup_books_folder else (0, 0)
         text = (
             f"Backup folder: {folder or 'Not set'}\n"
             f"Schedule: {self.backup_schedule_label()}\n"
             f"Last backup: {self.db.get_setting('last_backup_at', 'Never') or 'Never'}\n"
-            f"Backup file: {backup_file if backup_file and backup_file.exists() else 'Not found'}\n"
+            f"Database backup file: {backup_file if backup_file and backup_file.exists() else 'Not found'}\n"
+            f"Books backup folder: {backup_books_folder if backup_books_folder and backup_books_folder.exists() else 'Not found'}\n"
+            f"Book files in backup folder: {current_backup_book_count}\n"
             f"Manifest file: {manifest_file if manifest_file and manifest_file.exists() else 'Not found'}\n"
-            f"Books in last manifest: {manifest.get('book_count', 'Unknown')}"
+            f"Books in last manifest: {manifest.get('book_count', 'Unknown')}\n"
+            f"Book files in last manifest: {manifest.get('backup_book_file_count', 'Unknown')}\n"
+            f"Book backup size in last manifest: {manifest.get('backup_book_byte_count', current_backup_book_bytes)} bytes"
         )
         messagebox.showinfo("Library Backup Status", text)
+
+    def watched_folders(self):
+        raw = self.db.get_setting("watched_folders", "[]")
+        try:
+            folders = json.loads(raw)
+        except Exception:
+            folders = []
+        clean = []
+        seen = set()
+        for folder in folders:
+            try:
+                path = str(Path(folder).expanduser())
+            except Exception:
+                continue
+            key = path.casefold()
+            if path and key not in seen:
+                clean.append(path)
+                seen.add(key)
+        return clean
+
+    def save_watched_folders(self, folders):
+        self.db.set_setting("watched_folders", json.dumps(folders))
+
+    def watched_folder_auto_scan_enabled(self):
+        return self.db.get_setting("watched_folder_auto_scan", "1") == "1"
+
+    def watched_file_signatures(self):
+        raw = self.db.get_setting("watched_file_signatures", "{}")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    def save_watched_file_signatures(self, signatures):
+        self.db.set_setting("watched_file_signatures", json.dumps(signatures, sort_keys=True))
+
+    def file_signature(self, path: Path):
+        try:
+            stat = path.stat()
+            return f"{stat.st_mtime_ns}:{stat.st_size}"
+        except Exception:
+            return ""
+
+    def canonical_path_text(self, path: Path):
+        try:
+            return str(path.resolve())
+        except Exception:
+            return str(path.absolute())
+
+    def path_is_inside(self, path: Path, parent: Path):
+        try:
+            path.resolve().relative_to(parent.resolve())
+            return True
+        except Exception:
+            return False
+
+    def add_watched_folder(self):
+        folder = filedialog.askdirectory(title="Choose folder to watch for books")
+        if not folder:
+            return
+        path = self.canonical_path_text(Path(folder))
+        folders = self.watched_folders()
+        if path.casefold() not in [existing.casefold() for existing in folders]:
+            folders.append(path)
+            self.save_watched_folders(folders)
+        self.db.set_setting("watched_folder_auto_scan", "1")
+        self.status_var.set(f"Watched folder added: {path}")
+        messagebox.showinfo(
+            "Watched Folder Added",
+            f"The app will scan this folder for new or changed books:\n\n{path}"
+        )
+        self.schedule_watched_folder_scan(1000)
+
+    def remove_watched_folder(self):
+        folders = self.watched_folders()
+        if not folders:
+            messagebox.showinfo("Watched Folders", "No watched folders are set.")
+            return
+        lines = [f"{index}. {folder}" for index, folder in enumerate(folders, start=1)]
+        value = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "Remove Watched Folder",
+            "Type the number of the watched folder to remove.\n\n" + "\n".join(lines),
+            "1",
+            heading="Remove Watched Folder",
+        )
+        if value is None:
+            return
+        try:
+            index = int(value.strip())
+        except ValueError:
+            messagebox.showerror("Invalid choice", "Please enter one of the listed numbers.")
+            return
+        if index < 1 or index > len(folders):
+            messagebox.showerror("Invalid choice", "Please enter one of the listed numbers.")
+            return
+        removed = folders.pop(index - 1)
+        self.save_watched_folders(folders)
+        self.status_var.set(f"Watched folder removed: {removed}")
+        messagebox.showinfo("Watched Folder Removed", f"Removed watched folder:\n\n{removed}")
+
+    def toggle_watched_folder_auto_scan(self):
+        enabled = not self.watched_folder_auto_scan_enabled()
+        self.db.set_setting("watched_folder_auto_scan", "1" if enabled else "0")
+        state = "on" if enabled else "off"
+        self.status_var.set(f"Automatic watched folder scanning turned {state}.")
+        messagebox.showinfo("Watched Folders", f"Automatic watched folder scanning is now {state}.")
+        if enabled:
+            self.schedule_watched_folder_scan(1000)
+
+    def show_watched_folder_status(self):
+        folders = self.watched_folders()
+        folder_text = "\n".join(folders) if folders else "None"
+        state = "On" if self.watched_folder_auto_scan_enabled() else "Off"
+        messagebox.showinfo(
+            "Watched Folder Status",
+            f"Automatic scanning: {state}\n\nWatched folders:\n{folder_text}"
+        )
+
+    def schedule_watched_folder_scan(self, delay_ms=None):
+        if self.watched_scan_after is not None:
+            try:
+                self.root.after_cancel(self.watched_scan_after)
+            except Exception:
+                pass
+        if delay_ms is None:
+            delay_ms = 5 * 60 * 1000
+        self.watched_scan_after = self.root.after(delay_ms, self.check_watched_folders)
+
+    def check_watched_folders(self):
+        self.watched_scan_after = None
+        try:
+            if self.watched_folder_auto_scan_enabled() and self.watched_folders():
+                self.scan_watched_folders(automatic=True)
+        finally:
+            self.schedule_watched_folder_scan()
+
+    def scan_watched_folders_now(self):
+        self.scan_watched_folders(automatic=False)
+
+    def iter_watched_book_files(self):
+        managed_folder = self.db.books_path
+        for folder_text in self.watched_folders():
+            folder = Path(folder_text)
+            if not folder.exists():
+                yield None, f"{folder} -- watched folder not found"
+                continue
+            try:
+                for path in folder.rglob("*"):
+                    if self.path_is_inside(path, managed_folder):
+                        continue
+                    if self.is_ignored_watched_file(path):
+                        continue
+                    if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        yield path, ""
+            except Exception as exc:
+                yield None, f"{folder} -- {exc}"
+
+    def is_ignored_watched_file(self, path: Path):
+        if not path.is_file():
+            return False
+
+        if path.name.casefold() in {
+            "please do not delete this file.txt",
+            "do not delete.txt",
+        }:
+            return True
+
+        if path.suffix.lower() not in {".txt", ".rtf", ".html", ".htm"}:
+            return False
+
+        try:
+            if path.stat().st_size > 65536:
+                return False
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return False
+
+        normalized_text = re.sub(r"\s+", " ", text).strip().casefold()
+        normalized_notice = re.sub(r"\s+", " ", VOICE_DREAM_LIBRARY_NOTICE).strip().casefold()
+        return normalized_notice in normalized_text
+
+    def update_existing_watched_book(self, row, source_path: Path):
+        stored_path = Path(row[8])
+        if not stored_path.exists():
+            destination = self.unique_destination(
+                safe_filename(f"{row[2]} - {row[1]}").strip(" -") or safe_filename(row[1]),
+                source_path.suffix.lower(),
+            )
+            shutil.copy2(source_path, destination)
+            self.db.connection.execute(
+                "UPDATE books SET stored_path = ?, format = ? WHERE id = ?",
+                (str(destination), destination.suffix.lower().lstrip("."), row[0]),
+            )
+            self.db.connection.commit()
+            stored_path = destination
+        else:
+            shutil.copy2(source_path, stored_path)
+        if stored_path.suffix.lower() == ".epub":
+            self.update_accessibility_from_epub(row[0], stored_path)
+
+    def watched_file_matches_existing_book(self, source_path: Path):
+        try:
+            source_stat = source_path.stat()
+        except Exception:
+            return None
+
+        for row in self.db.all_books_for_duplicate_check():
+            stored_path = Path(row[8])
+            try:
+                if source_path.resolve() == stored_path.resolve():
+                    return row
+            except Exception:
+                pass
+
+            try:
+                stored_stat = stored_path.stat()
+            except Exception:
+                continue
+
+            if source_stat.st_size != stored_stat.st_size:
+                continue
+
+            try:
+                if filecmp.cmp(source_path, stored_path, shallow=False):
+                    return row
+            except Exception:
+                continue
+        return None
+
+    def scan_watched_folders(self, automatic=False):
+        if self.watched_scan_running:
+            return
+        if not self.watched_folders():
+            if not automatic:
+                messagebox.showinfo("Watched Folders", "No watched folders are set. Add one from Settings, Watched Folders.")
+            return
+
+        self.watched_scan_running = True
+        imported = 0
+        updated = 0
+        skipped = []
+        signatures = self.watched_file_signatures()
+        try:
+            self.status_var.set("Scanning watched folders.")
+            self.root.update_idletasks()
+            for path, error in self.iter_watched_book_files():
+                if error:
+                    skipped.append(error)
+                    continue
+                if path is None:
+                    continue
+                canonical = self.canonical_path_text(path)
+                signature = self.file_signature(path)
+                if signature and signatures.get(canonical) == signature:
+                    continue
+                try:
+                    existing = self.db.get_book_by_original_path(canonical)
+                    if existing and path.suffix.lower() != ".zip":
+                        self.update_existing_watched_book(existing, path)
+                        updated += 1
+                    elif self.watched_file_matches_existing_book(path):
+                        skipped.append(f"{path} -- already in library")
+                    elif path.suffix.lower() == ".zip":
+                        zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="Watched Folder")
+                        imported += zip_imported
+                        skipped.extend(zip_skipped)
+                    elif self.import_one_book_without_prompt(path, default_source="Watched Folder"):
+                        imported += 1
+                    if signature:
+                        signatures[canonical] = signature
+                except sqlite3.IntegrityError:
+                    if signature:
+                        signatures[canonical] = signature
+                    skipped.append(f"{path} -- already imported")
+                except Exception as exc:
+                    skipped.append(f"{path} -- {exc}")
+                    self.log_error(f"Watched folder scan: {path}", exc)
+            self.save_watched_file_signatures(signatures)
+            if imported or updated:
+                self.refresh_books()
+            if skipped or imported or updated:
+                self.write_import_report(imported + updated, skipped)
+            message = f"Watched folder scan complete. Imported {imported}. Updated {updated}. Skipped {len(skipped)}."
+            self.status_var.set(message)
+            if not automatic:
+                messagebox.showinfo("Watched Folder Scan", message)
+        finally:
+            self.watched_scan_running = False
 
     def explorer_context_menu_registry_paths(self):
         paths = []
@@ -2943,6 +4210,20 @@ class LibraryApp:
         else:
             self.status_var.set(self.book_list.get(index))
 
+    def move_to_first_book(self, event=None):
+        if self.book_list.size() == 0:
+            self.status_var.set("No books are shown.")
+            return "break"
+        self.select_book_list_index(0)
+        return "break"
+
+    def move_to_last_book(self, event=None):
+        if self.book_list.size() == 0:
+            self.status_var.set("No books are shown.")
+            return "break"
+        self.select_book_list_index(self.book_list.size() - 1)
+        return "break"
+
     def toggle_mark_current_book(self, event=None):
         index = self.current_book_index()
         if index is None or index >= len(self.book_list_ids):
@@ -3026,7 +4307,7 @@ class LibraryApp:
         if field_index < 0 or field_index >= len(BOOK_LIST_SPEECH_FIELDS):
             return "break"
 
-        book_id = self.selected_book_id()
+        book_id = self.selected_book_id_quiet()
         if book_id is None:
             return "break"
 
@@ -3153,6 +4434,29 @@ class LibraryApp:
         self.book_list.activate(index)
         self.book_list.see(index)
         return index
+
+    def current_book_index_quiet(self):
+        if self.book_list.size() == 0:
+            return None
+
+        selected = self.book_list.curselection()
+        if selected:
+            index = selected[0]
+        else:
+            try:
+                index = self.book_list.index("active")
+            except Exception:
+                index = 0
+
+        if index < 0 or index >= self.book_list.size():
+            return 0
+        return index
+
+    def selected_book_id_quiet(self):
+        index = self.current_book_index_quiet()
+        if index is None or index >= len(self.book_list_ids):
+            return None
+        return int(self.book_list_ids[index])
 
     def selected_book_id(self):
         if self.book_list.size() == 0:
@@ -3480,7 +4784,7 @@ class LibraryApp:
             metadata["source"],
             metadata["tags"],
             metadata["notes"],
-            str(source_path),
+            self.canonical_path_text(source_path),
             str(destination),
         )
         self.db.update_extra_fields(
@@ -3554,6 +4858,20 @@ class LibraryApp:
                 )
                 return
 
+            if len(supported) > 1 and messagebox.askyesno(
+                "One book in multiple parts?",
+                "Does this folder contain one book split into multiple part files?\n\n"
+                "Choose Yes to combine the files into one EPUB and add one book to the library. "
+                "Choose No to import each file as a separate book."
+            ):
+                self.start_combined_folder_import(
+                    root_folder,
+                    sorted(supported, key=book_part_sort_key),
+                    default_source.strip(),
+                    skipped_items,
+                )
+                return
+
             if not messagebox.askyesno(
                 "Confirm folder import",
                 f"Found {len(supported)} supported file{'s' if len(supported) != 1 else ''}. Import them now?"
@@ -3608,6 +4926,397 @@ class LibraryApp:
                 f"Folder import hit an unexpected error, but the app caught it this time.\n\n{exc}\n\n"
                 f"Crash details saved at:\n{self.crash_log_path()}"
             )
+
+    def start_combined_folder_import(self, root_folder: Path, parts: list[Path], default_source: str, skipped_items: list[str]):
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Combining Book Parts")
+        progress_window.transient(self.root)
+        progress_window.resizable(False, False)
+        progress_window.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        message_var = StringVar(value="Preparing to read book parts.")
+        ttk.Label(progress_window, textvariable=message_var, padding=12).pack(fill=X)
+        progress = ttk.Progressbar(progress_window, mode="indeterminate", length=320)
+        progress.pack(fill=X, padx=12, pady=(0, 12))
+        progress.start(12)
+
+        work_queue = queue.Queue()
+        total = len(parts)
+        self.status_var.set(f"Combining {total} book part{'s' if total != 1 else ''}.")
+
+        def worker():
+            local_skipped = list(skipped_items)
+            readable_parts = []
+            combined_sample = []
+            try:
+                for index, part in enumerate(parts, start=1):
+                    work_queue.put(("progress", index, total, part.name))
+                    if part.suffix.lower() == ".zip":
+                        local_skipped.append(f"{part} -- ZIP files cannot be combined into one EPUB")
+                        continue
+                    text = read_text_for_metadata_detection(part, max_chars=250000)
+                    if not text.strip():
+                        local_skipped.append(f"{part} -- no readable text found for combined EPUB")
+                        continue
+                    readable_parts.append((part, text))
+                    if len(" ".join(combined_sample)) < 50000:
+                        combined_sample.append(text[:10000])
+                work_queue.put(("done", readable_parts, combined_sample, local_skipped, None))
+            except Exception as exc:
+                work_queue.put(("done", [], [], local_skipped, exc))
+
+        def poll_worker():
+            try:
+                while True:
+                    item = work_queue.get_nowait()
+                    if item[0] == "progress":
+                        _kind, index, count, name = item
+                        message = f"Reading part {index} of {count}: {name}"
+                        message_var.set(message)
+                        self.status_var.set(message)
+                    elif item[0] == "done":
+                        _kind, readable_parts, combined_sample, final_skipped, error = item
+                        progress.stop()
+                        progress_window.destroy()
+                        if error:
+                            self.log_error("Reading combined folder parts", error)
+                            report_path = self.write_import_report(0, final_skipped)
+                            messagebox.showerror(
+                                "Combined EPUB import failed",
+                                f"I could not finish reading the book parts.\n\n{error}\n\n"
+                                f"Import report saved at:\n{report_path}"
+                            )
+                            self.status_var.set("Combined EPUB import failed.")
+                            return
+                        self.finish_combined_folder_import(
+                            root_folder,
+                            readable_parts,
+                            combined_sample,
+                            default_source,
+                            final_skipped,
+                        )
+                        return
+            except queue.Empty:
+                pass
+            self.root.after(200, poll_worker)
+
+        threading.Thread(target=worker, daemon=True).start()
+        poll_worker()
+
+    def finish_combined_folder_import(self, root_folder: Path, readable_parts, combined_sample, default_source: str, skipped_items: list[str]):
+        imported = self.finish_combined_epub_import(root_folder, readable_parts, combined_sample, default_source, skipped_items)
+        report_path = self.write_import_report(imported, skipped_items)
+        self.refresh_books()
+        if imported:
+            self.focus_books_list()
+        messagebox.showinfo(
+            "Combined EPUB import complete",
+            f"Imported {imported} combined EPUB book{'s' if imported != 1 else ''}. "
+            f"Skipped {len(skipped_items)} file{'s' if len(skipped_items) != 1 else ''}.\n\n"
+            f"Import report saved at:\n{report_path}"
+        )
+        self.status_var.set(f"Combined EPUB import complete. Imported {imported}. Skipped {len(skipped_items)}.")
+
+    def import_folder_as_combined_epub(self, root_folder: Path, parts: list[Path], default_source: str, skipped_items: list[str]):
+        readable_parts = []
+        combined_sample = []
+        for part in parts:
+            if part.suffix.lower() == ".zip":
+                skipped_items.append(f"{part} -- ZIP files cannot be combined into one EPUB")
+                continue
+            text = read_text_for_metadata_detection(part, max_chars=250000)
+            if not text.strip():
+                skipped_items.append(f"{part} -- no readable text found for combined EPUB")
+                continue
+            readable_parts.append((part, text))
+            if len(" ".join(combined_sample)) < 50000:
+                combined_sample.append(text[:10000])
+
+        return self.finish_combined_epub_import(root_folder, readable_parts, combined_sample, default_source, skipped_items)
+
+    def finish_combined_epub_import(self, root_folder: Path, readable_parts, combined_sample, default_source: str, skipped_items: list[str]):
+        if not readable_parts:
+            messagebox.showerror(
+                "Could not combine folder",
+                "I could not find readable text in the selected folder parts."
+            )
+            return 0
+
+        initial_metadata = {
+            "title": clean_filename_title(root_folder),
+            "author": "",
+            "edition": "",
+            "year": "",
+            "isbn": "",
+            "publisher": "",
+            "source": default_source,
+            "tags": "",
+            "notes": "",
+        }
+        detected = detect_metadata_from_text_content("\n".join(combined_sample), existing=initial_metadata)
+        initial_metadata.update({key: value for key, value in detected.items() if value})
+
+        metadata = TkMetadataDialog.ask(self.root, "Combined Book Metadata", initial_metadata)
+        if not metadata:
+            return 0
+
+        output_name = safe_filename(f"{metadata['author']} - {metadata['title']}").strip(" -") or safe_filename(metadata["title"])
+        destination = self.unique_destination(output_name, ".epub")
+        self.create_combined_epub(destination, readable_parts, metadata, root_folder=root_folder)
+
+        new_book_id = self.db.add_book(
+            metadata["title"],
+            metadata["author"],
+            metadata["source"],
+            metadata["tags"],
+            metadata["notes"],
+            self.canonical_path_text(root_folder),
+            str(destination),
+        )
+        self.db.update_extra_fields(
+            new_book_id,
+            metadata.get("edition", ""),
+            metadata.get("year", ""),
+            metadata.get("isbn", ""),
+            metadata.get("publisher", ""),
+        )
+        self.update_accessibility_from_epub(new_book_id, destination)
+        return 1
+
+    def create_combined_epub(self, destination: Path, readable_parts, metadata, root_folder: Path | None = None):
+        book_uuid = f"urn:uuid:{uuid.uuid4()}"
+        title = metadata.get("title", "Untitled") or "Untitled"
+        author = metadata.get("author", "") or "Unknown"
+        publisher = metadata.get("publisher", "") or ""
+        year = metadata.get("year", "") or ""
+        isbn = metadata.get("isbn", "") or ""
+        combined_text = "\n".join(text for _part_path, text in readable_parts)
+        language = detect_language_from_text(combined_text, default="en")
+        modified = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        chapters = []
+        text_toc_entries = parse_text_toc_entries(combined_text)
+        source_note_parts = []
+        if root_folder:
+            source_note_parts.append(f"Combined source folder: {root_folder}")
+        source_note_parts.append("Combined source files:")
+        source_note_parts.extend(f"- {part_path.name}" for part_path, _text in readable_parts)
+        combined_source_note = "\n".join(source_note_parts)
+
+        for index, (part_path, text) in enumerate(readable_parts, start=1):
+            chapter_title = clean_filename_title(part_path) or f"Part {index}"
+            body = self.xhtml_body_from_text(text)
+            filename = f"chapter{index:04d}.xhtml"
+            chapters.append((filename, chapter_title, body))
+
+        container_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="EPUB/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+        page_targets = {}
+        for filename, _chapter_title, body in chapters:
+            for page_id in re.findall(r'id=["\'](page-[^"\']+)["\']', body, flags=re.IGNORECASE):
+                page_targets.setdefault(page_id.casefold(), filename)
+
+        toc_nav_entries = []
+        for entry in text_toc_entries:
+            target_filename = page_targets.get(entry["page_id"].casefold())
+            if target_filename:
+                toc_nav_entries.append((target_filename + "#" + entry["page_id"], entry["title"]))
+
+        if toc_nav_entries:
+            nav_items = "\n".join(
+                f'      <li><a href="{html.escape(href)}">{html.escape(label)}</a></li>'
+                for href, label in toc_nav_entries
+            )
+        else:
+            nav_items = "\n".join(
+                f'      <li><a href="{filename}">{html.escape(chapter_title)}</a></li>'
+                for filename, chapter_title, _body in chapters
+            )
+        nav_xhtml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{language}" xml:lang="{language}">
+  <head><title>Table of Contents</title></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h1>Table of Contents</h1>
+      <ol>
+{nav_items}
+      </ol>
+    </nav>
+  </body>
+</html>
+"""
+        manifest_items = ['    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>']
+        spine_items = []
+        for index, (filename, _chapter_title, _body) in enumerate(chapters, start=1):
+            manifest_items.append(f'    <item id="chapter{index}" href="{filename}" media-type="application/xhtml+xml"/>')
+            spine_items.append(f'    <itemref idref="chapter{index}"/>')
+
+        package_opf = f"""<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="book-id">{html.escape(book_uuid)}</dc:identifier>
+    <dc:title>{html.escape(title)}</dc:title>
+    <dc:creator>{html.escape(author)}</dc:creator>
+    <dc:language>{language}</dc:language>
+{f'    <dc:publisher>{html.escape(publisher)}</dc:publisher>' if publisher else ''}
+{f'    <dc:date>{html.escape(year)}</dc:date>' if year else ''}
+{f'    <dc:identifier>{html.escape(isbn)}</dc:identifier>' if isbn else ''}
+    <dc:relation>{html.escape(combined_source_note)}</dc:relation>
+    <meta property="schema:accessibilityFeature">tableOfContents</meta>
+    <meta property="dcterms:modified">{modified}</meta>
+  </metadata>
+  <manifest>
+{chr(10).join(manifest_items)}
+  </manifest>
+  <spine>
+{chr(10).join(spine_items)}
+  </spine>
+</package>
+"""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(destination, "w") as archive:
+            archive.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+            archive.writestr("META-INF/container.xml", container_xml)
+            archive.writestr("EPUB/package.opf", package_opf)
+            archive.writestr("EPUB/nav.xhtml", nav_xhtml)
+            for filename, chapter_title, body in chapters:
+                chapter_xhtml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{language}" xml:lang="{language}">
+  <head><title>{html.escape(chapter_title)}</title></head>
+  <body>
+    <h1>{html.escape(chapter_title)}</h1>
+{body}
+  </body>
+</html>
+"""
+                archive.writestr(f"EPUB/{filename}", chapter_xhtml)
+
+    def xhtml_body_from_text(self, text: str):
+        cleaned_lines, _removed = cleaned_lines_for_reflow(text)
+        output = []
+        paragraph_lines = []
+        used_page_ids = set()
+        previous_output_was_heading = False
+
+        def flush_paragraph():
+            nonlocal previous_output_was_heading
+            if not paragraph_lines:
+                return
+            paragraph = re.sub(r"\s+", " ", " ".join(paragraph_lines)).strip()
+            paragraph_lines.clear()
+            if paragraph:
+                output.append(f"    <p>{html.escape(paragraph)}</p>")
+                previous_output_was_heading = False
+
+        for raw_line in cleaned_lines:
+            line = raw_line.strip()
+            if not line:
+                flush_paragraph()
+                previous_output_was_heading = False
+                continue
+
+            page_label = page_label_from_line(line)
+            if page_label:
+                flush_paragraph()
+                output.append("    " + self.epub_pagebreak_span(page_label, used_page_ids))
+                previous_output_was_heading = False
+                continue
+
+            if looks_like_text_toc_entry_line(line):
+                flush_paragraph()
+                output.append(f"    <p>{html.escape(line)}</p>")
+                previous_output_was_heading = False
+                continue
+
+            if looks_like_standalone_heading_line(line) or (previous_output_was_heading and looks_like_heading_continuation_line(line)):
+                flush_paragraph()
+                if re.match(r"^(?:chapter|part|section|appendix|index|front matter|§|Â§)", line, flags=re.IGNORECASE) or previous_output_was_heading:
+                    output.append(f"    <h2>{html.escape(line)}</h2>")
+                    previous_output_was_heading = True
+                else:
+                    output.append(f"    <p>{html.escape(line)}</p>")
+                    previous_output_was_heading = False
+                continue
+
+            if line.endswith("?"):
+                flush_paragraph()
+                output.append(f"    <p>{html.escape(line)}</p>")
+                previous_output_was_heading = False
+                continue
+
+            paragraph_lines.append(line)
+
+        flush_paragraph()
+        if not output:
+            output.append("    <p>No text found.</p>")
+        return "\n".join(output)
+
+    def epub_pagebreak_span(self, page_label, used_page_ids):
+        page_label = str(page_label or "").strip()
+        page_id_base = page_id_for_label(page_label)
+        page_id = page_id_base
+        suffix = 2
+        while page_id in used_page_ids:
+            page_id = f"{page_id_base}-{suffix}"
+            suffix += 1
+        used_page_ids.add(page_id)
+        return (
+            f'<span epub:type="pagebreak" role="doc-pagebreak" id="{html.escape(page_id)}" '
+            f'aria-label="Page {html.escape(page_label)}"></span>'
+        )
+
+    def ensure_xhtml_epub_namespace(self, xhtml_text):
+        if "xmlns:epub=" in xhtml_text:
+            return xhtml_text
+        return re.sub(
+            r"<html\b([^>]*)>",
+            r'<html\1 xmlns:epub="http://www.idpf.org/2007/ops">',
+            xhtml_text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    def insert_pagebreaks_in_xhtml_text(self, xhtml_text):
+        used_page_ids = set(re.findall(r'id=["\'](page-[^"\']+)["\']', xhtml_text, flags=re.IGNORECASE))
+        inserted = 0
+
+        def replace_paragraph_start(match):
+            nonlocal inserted
+            opening = match.group(1)
+            label = match.group(2) or match.group(3)
+            rest = match.group(4).strip()
+            inserted += 1
+            return self.epub_pagebreak_span(label, used_page_ids) + "\n" + opening + rest
+
+        xhtml_text = re.sub(
+            r"(<p\b[^>]*>)\s*(?:(?:(?:p?age)\s+)+([0-9ivxlcdm]+)|(\d{1,4}))\s+([\s\S]*?</p>)",
+            replace_paragraph_start,
+            xhtml_text,
+            flags=re.IGNORECASE,
+        )
+
+        def replace_standalone(match):
+            nonlocal inserted
+            label = match.group(1)
+            inserted += 1
+            return ">" + self.epub_pagebreak_span(label, used_page_ids) + "<"
+
+        xhtml_text = re.sub(
+            r">\s*(?:(?:p?age)\s+)+([0-9ivxlcdm]+)\s*<",
+            replace_standalone,
+            xhtml_text,
+            flags=re.IGNORECASE,
+        )
+
+        if inserted:
+            xhtml_text = self.ensure_xhtml_epub_namespace(xhtml_text)
+        return xhtml_text, inserted
 
     def add_book(self):
         paths = filedialog.askopenfilenames(
@@ -3683,7 +5392,7 @@ class LibraryApp:
                 metadata["source"],
                 metadata["tags"],
                 metadata["notes"],
-                str(source_path),
+                self.canonical_path_text(source_path),
                 str(destination),
             )
             self.db.update_extra_fields(
@@ -3852,6 +5561,431 @@ class LibraryApp:
             "EPUB Accessibility Metadata",
             text if metadata else "No accessibility metadata could be checked for this EPUB."
         )
+
+    def add_page_breaks_to_selected_epub(self):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return
+
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return
+
+        stored_path = Path(row[8])
+        if stored_path.suffix.lower() != ".epub":
+            messagebox.showinfo("EPUB only", "Page-break repair is available for EPUB books.")
+            return
+        if not stored_path.exists():
+            messagebox.showerror("Book file missing", "The stored EPUB file could not be found.")
+            return
+
+        if not messagebox.askyesno(
+            "Add EPUB Page Breaks",
+            "Scan this EPUB for written page labels such as Page 277 or age 277 and turn them into EPUB page-break markers?\n\n"
+            "A backup copy of the EPUB will be made first."
+        ):
+            return
+
+        try:
+            inserted = self.add_page_breaks_to_epub_file(stored_path)
+        except Exception as exc:
+            self.log_error("Adding EPUB page breaks", exc)
+            messagebox.showerror(
+                "Page-break repair failed",
+                f"Could not add page breaks to this EPUB.\n\n{exc}\n\nCrash details saved at:\n{self.crash_log_path()}"
+            )
+            return
+
+        if inserted:
+            self.update_accessibility_from_epub(book_id, stored_path)
+            self.refresh_books(selected_book_id=book_id)
+            self.focus_books_list()
+            self.status_var.set(f"Added {inserted} EPUB page break{'s' if inserted != 1 else ''}.")
+            messagebox.showinfo(
+                "Page Breaks Added",
+                f"Added {inserted} EPUB page break{'s' if inserted != 1 else ''}."
+            )
+        else:
+            self.status_var.set("No written page labels were found.")
+            messagebox.showinfo(
+                "No Page Labels Found",
+                "I did not find written page labels like Page 277 or age 277 in this EPUB."
+            )
+
+    def add_page_breaks_to_epub_file(self, epub_path: Path):
+        temp_path = epub_path.with_suffix(epub_path.suffix + ".pagebreaks.tmp")
+        backup_path = epub_path.with_suffix(epub_path.suffix + ".before_pagebreaks.bak")
+        inserted_total = 0
+
+        with zipfile.ZipFile(epub_path, "r") as source_archive:
+            with zipfile.ZipFile(temp_path, "w") as target_archive:
+                for item in source_archive.infolist():
+                    data = source_archive.read(item.filename)
+                    if item.filename.lower().endswith((".xhtml", ".html", ".htm")):
+                        try:
+                            text = data.decode("utf-8")
+                            updated, inserted = self.insert_pagebreaks_in_xhtml_text(text)
+                            if inserted:
+                                data = updated.encode("utf-8")
+                                inserted_total += inserted
+                        except UnicodeDecodeError:
+                            try:
+                                text = data.decode("latin-1")
+                                updated, inserted = self.insert_pagebreaks_in_xhtml_text(text)
+                                if inserted:
+                                    data = updated.encode("utf-8")
+                                    inserted_total += inserted
+                            except Exception:
+                                pass
+                    target_archive.writestr(item, data)
+
+        if inserted_total:
+            if not backup_path.exists():
+                shutil.copy2(epub_path, backup_path)
+            os.replace(temp_path, epub_path)
+        else:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        return inserted_total
+
+    def rebuild_selected_epub_toc_from_text(self):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return
+
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return
+
+        stored_path = Path(row[8])
+        if stored_path.suffix.lower() != ".epub":
+            messagebox.showinfo("EPUB only", "Table of contents repair is available for EPUB books.")
+            return
+        if not stored_path.exists():
+            messagebox.showerror("Book file missing", "The stored EPUB file could not be found.")
+            return
+
+        if not messagebox.askyesno(
+            "Rebuild EPUB Table of Contents",
+            "Look for a text Table of Contents in this EPUB and rebuild the EPUB navigation from it?\n\n"
+            "The app will first scan for written page labels and add EPUB page-break markers if needed. "
+            "Backup copies of the EPUB will be made before repairs."
+        ):
+            return
+
+        try:
+            self.status_var.set("Checking page labels before rebuilding the table of contents.")
+            inserted = self.add_page_breaks_to_epub_file(stored_path)
+            added, skipped = self.rebuild_epub_toc_from_text(stored_path)
+        except Exception as exc:
+            self.log_error("Rebuilding EPUB TOC from text", exc)
+            messagebox.showerror(
+                "TOC repair failed",
+                f"Could not rebuild the EPUB table of contents.\n\n{exc}\n\nCrash details saved at:\n{self.crash_log_path()}"
+            )
+            return
+
+        if added:
+            self.update_accessibility_from_epub(book_id, stored_path)
+            self.refresh_books(selected_book_id=book_id)
+            self.focus_books_list()
+            self.status_var.set(f"Rebuilt EPUB table of contents with {added} item{'s' if added != 1 else ''}.")
+            messagebox.showinfo(
+                "Table of Contents Rebuilt",
+                f"Added {inserted} page-break marker{'s' if inserted != 1 else ''} before rebuilding.\n\n"
+                f"Built EPUB navigation with {added} item{'s' if added != 1 else ''} from the text table of contents.\n\n"
+                f"Skipped {skipped} item{'s' if skipped != 1 else ''} that did not have matching page-break anchors."
+            )
+        else:
+            self.status_var.set("No usable text table of contents was found.")
+            messagebox.showinfo(
+                "No TOC Built",
+                f"Added {inserted} page-break marker{'s' if inserted != 1 else ''}, but I could not build navigation from the text table of contents."
+            )
+
+    def rebuild_epub_toc_from_text(self, epub_path: Path):
+        text = read_text_from_epub_preserve_lines(epub_path, max_chars=750000)
+        toc_entries = parse_text_toc_entries(text)
+        if not toc_entries:
+            return 0, 0
+
+        opf_path = get_epub_opf_path(epub_path)
+        temp_path = epub_path.with_suffix(epub_path.suffix + ".toc.tmp")
+        backup_path = epub_path.with_suffix(epub_path.suffix + ".before_toc_rebuild.bak")
+
+        with zipfile.ZipFile(epub_path, "r") as source_archive:
+            opf_xml = source_archive.read(opf_path)
+            root = ET.fromstring(opf_xml)
+            ns = {"opf": OPF_NS}
+            manifest = root.find("opf:manifest", ns)
+            if manifest is None:
+                manifest = ET.SubElement(root, f"{{{OPF_NS}}}manifest")
+
+            nav_item = None
+            for item in manifest.findall("opf:item", ns):
+                properties = item.attrib.get("properties", "")
+                if "nav" in properties.split():
+                    nav_item = item
+                    break
+
+            if nav_item is None:
+                existing_ids = {item.attrib.get("id", "") for item in manifest.findall("opf:item", ns)}
+                nav_id = "nav"
+                suffix = 2
+                while nav_id in existing_ids:
+                    nav_id = f"nav{suffix}"
+                    suffix += 1
+                nav_item = ET.SubElement(manifest, f"{{{OPF_NS}}}item")
+                nav_item.set("id", nav_id)
+                nav_item.set("href", "nav.xhtml")
+                nav_item.set("media-type", "application/xhtml+xml")
+                nav_item.set("properties", "nav")
+
+            nav_href = nav_item.attrib.get("href") or "nav.xhtml"
+            nav_item.set("media-type", "application/xhtml+xml")
+            nav_item.set("properties", "nav")
+            opf_dir = posixpath.dirname(opf_path)
+            nav_path = posixpath.normpath(posixpath.join(opf_dir, nav_href))
+            nav_dir = posixpath.dirname(nav_path)
+
+            page_targets = {}
+            for item in source_archive.infolist():
+                name = item.filename
+                if name == nav_path or not name.lower().endswith((".xhtml", ".html", ".htm")):
+                    continue
+                try:
+                    content = source_archive.read(name).decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                for page_id in re.findall(r'id=["\'](page-[^"\']+)["\']', content, flags=re.IGNORECASE):
+                    href = posixpath.relpath(name, nav_dir) if nav_dir else name
+                    page_targets.setdefault(page_id.casefold(), href + "#" + page_id)
+
+            nav_entries = []
+            for entry in toc_entries:
+                href = page_targets.get(entry["page_id"].casefold())
+                if href:
+                    nav_entries.append((href, entry["title"]))
+
+            if not nav_entries:
+                return 0, len(toc_entries)
+
+            title = ""
+            try:
+                row_title = first_or_empty(root, ".//dc:title", {"dc": DC_NS})
+                title = row_title or "Table of Contents"
+            except Exception:
+                title = "Table of Contents"
+            nav_xhtml = self.build_nav_xhtml(title, nav_entries)
+            new_opf_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+            with zipfile.ZipFile(temp_path, "w") as target_archive:
+                wrote_nav = False
+                for item in source_archive.infolist():
+                    if item.filename == opf_path:
+                        target_archive.writestr(item, new_opf_xml)
+                    elif item.filename == nav_path:
+                        target_archive.writestr(item, nav_xhtml.encode("utf-8"))
+                        wrote_nav = True
+                    else:
+                        target_archive.writestr(item, source_archive.read(item.filename))
+                if not wrote_nav:
+                    target_archive.writestr(nav_path, nav_xhtml.encode("utf-8"))
+
+        if not backup_path.exists():
+            shutil.copy2(epub_path, backup_path)
+        os.replace(temp_path, epub_path)
+        return len(nav_entries), len(toc_entries) - len(nav_entries)
+
+    def build_nav_xhtml(self, title, nav_entries):
+        nav_items = "\n".join(
+            f'      <li><a href="{html.escape(href)}">{html.escape(label)}</a></li>'
+            for href, label in nav_entries
+        )
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en" xml:lang="en">
+  <head><title>{html.escape(title or "Table of Contents")}</title></head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h1>Table of Contents</h1>
+      <ol>
+{nav_items}
+      </ol>
+    </nav>
+  </body>
+</html>
+"""
+
+    def clean_selected_epub_text(self):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return
+
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return
+
+        stored_path = Path(row[8])
+        if stored_path.suffix.lower() != ".epub":
+            messagebox.showinfo("EPUB only", "Text cleanup is available for EPUB books.")
+            return
+        if not stored_path.exists():
+            messagebox.showerror("Book file missing", "The stored EPUB file could not be found.")
+            return
+
+        if not messagebox.askyesno(
+            "Clean EPUB Text",
+            "Clean this EPUB by removing repeated short headers or footers, removing blank-page notices, adding language metadata, and adding page breaks from page labels?\n\n"
+            "A backup copy of the EPUB will be made first."
+        ):
+            return
+
+        try:
+            changed = self.clean_epub_text_file(stored_path)
+        except Exception as exc:
+            self.log_error("Cleaning EPUB text", exc)
+            messagebox.showerror(
+                "EPUB cleanup failed",
+                f"Could not clean this EPUB.\n\n{exc}\n\nCrash details saved at:\n{self.crash_log_path()}"
+            )
+            return
+
+        self.update_accessibility_from_epub(book_id, stored_path)
+        self.refresh_books(selected_book_id=book_id)
+        self.focus_books_list()
+        self.status_var.set(f"EPUB text cleanup complete. {changed} change{'s' if changed != 1 else ''} made.")
+        messagebox.showinfo(
+            "EPUB Cleanup Complete",
+            f"Made {changed} text cleanup change{'s' if changed != 1 else ''}."
+        )
+
+    def paragraph_texts_from_xhtml(self, xhtml_text):
+        texts = []
+        for match in re.finditer(r"<p\b[^>]*>([\s\S]*?)</p>", xhtml_text, flags=re.IGNORECASE):
+            text = strip_xml_html_tags_preserve_lines(match.group(1))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                texts.append(text)
+        return texts
+
+    def repeated_paragraphs_for_cleanup(self, xhtml_documents):
+        counts = {}
+        originals = {}
+        for _name, text in xhtml_documents:
+            for paragraph in self.paragraph_texts_from_xhtml(text):
+                key = paragraph.casefold()
+                counts[key] = counts.get(key, 0) + 1
+                originals[key] = paragraph
+
+        repeated = set()
+        for key, count in counts.items():
+            paragraph = originals[key]
+            if count < 4:
+                continue
+            if len(paragraph) > 120:
+                continue
+            if is_page_label_line(paragraph) or looks_like_text_toc_entry_line(paragraph):
+                continue
+            if re.match(r"^(chapter|part|section|appendix)\b", paragraph, flags=re.IGNORECASE):
+                continue
+            repeated.add(key)
+        return repeated
+
+    def clean_xhtml_text(self, xhtml_text, repeated_paragraphs):
+        removed = 0
+
+        def replace_paragraph(match):
+            nonlocal removed
+            opening = match.group(1)
+            inner = match.group(2)
+            closing = match.group(3)
+            text = strip_xml_html_tags_preserve_lines(inner)
+            normalized = re.sub(r"\s+", " ", text).strip()
+            if normalized and (is_import_boilerplate_line(normalized) or normalized.casefold() in repeated_paragraphs):
+                removed += 1
+                return ""
+            return opening + inner + closing
+
+        xhtml_text = re.sub(
+            r"(<p\b[^>]*>)([\s\S]*?)(</p>)",
+            replace_paragraph,
+            xhtml_text,
+            flags=re.IGNORECASE,
+        )
+        xhtml_text, inserted = self.insert_pagebreaks_in_xhtml_text(xhtml_text)
+        return xhtml_text, removed + inserted
+
+    def clean_epub_text_file(self, epub_path: Path):
+        temp_path = epub_path.with_suffix(epub_path.suffix + ".clean.tmp")
+        backup_path = epub_path.with_suffix(epub_path.suffix + ".before_text_cleanup.bak")
+        changed_total = 0
+
+        with zipfile.ZipFile(epub_path, "r") as source_archive:
+            xhtml_documents = []
+            for item in source_archive.infolist():
+                if item.filename.lower().endswith((".xhtml", ".html", ".htm")):
+                    try:
+                        xhtml_documents.append((item.filename, source_archive.read(item.filename).decode("utf-8", errors="ignore")))
+                    except Exception:
+                        pass
+            repeated = self.repeated_paragraphs_for_cleanup(xhtml_documents)
+            language_text = "\n".join(
+                strip_xml_html_tags_preserve_lines(text)
+                for _name, text in xhtml_documents[:40]
+            )
+            detected_language = detect_language_from_text(language_text, default="en")
+
+            opf_path = get_epub_opf_path(epub_path)
+            opf_xml = source_archive.read(opf_path)
+            root = ET.fromstring(opf_xml)
+            metadata = root.find(f"{{{OPF_NS}}}metadata")
+            if metadata is None:
+                metadata = ET.SubElement(root, f"{{{OPF_NS}}}metadata")
+            language_before = first_or_empty(root, ".//dc:language", {"dc": DC_NS})
+            if not language_before:
+                set_single_text(metadata, f"{{{DC_NS}}}language", detected_language)
+                changed_total += 1
+            new_opf_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+            with zipfile.ZipFile(temp_path, "w") as target_archive:
+                for item in source_archive.infolist():
+                    data = source_archive.read(item.filename)
+                    if item.filename == opf_path:
+                        data = new_opf_xml
+                    elif item.filename.lower().endswith((".xhtml", ".html", ".htm")):
+                        try:
+                            text = data.decode("utf-8")
+                            updated, changed = self.clean_xhtml_text(text, repeated)
+                            if changed:
+                                data = updated.encode("utf-8")
+                                changed_total += changed
+                        except UnicodeDecodeError:
+                            try:
+                                text = data.decode("latin-1")
+                                updated, changed = self.clean_xhtml_text(text, repeated)
+                                if changed:
+                                    data = updated.encode("utf-8")
+                                    changed_total += changed
+                            except Exception:
+                                pass
+                    target_archive.writestr(item, data)
+
+        if changed_total:
+            if not backup_path.exists():
+                shutil.copy2(epub_path, backup_path)
+            os.replace(temp_path, epub_path)
+        else:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        return changed_total
 
     def lookup_selected_metadata_online(self):
         book_id = self.selected_book_id()
@@ -4870,59 +7004,107 @@ catch {
         return self.choose_voice_dream_folder()
 
     def send_to_voice_dream(self):
-        book_id = self.selected_book_id()
-        if book_id is None:
+        self.copy_selected_books_to_folder_target(
+            app_name="Voice Dream",
+            folder_name="Voice Dream Loader folder",
+            folder_getter=self.get_voice_dream_folder,
+            setting_key="voice_dream_loader_folder",
+        )
+
+    def choose_dolphin_easyreader_folder(self):
+        folder = filedialog.askdirectory(
+            title="Choose Dolphin EasyReader folder"
+        )
+        if not folder:
+            return None
+
+        self.db.set_setting("dolphin_easyreader_folder", folder)
+        self.status_var.set(f"Dolphin EasyReader folder set to {folder}.")
+        messagebox.showinfo(
+            "Dolphin EasyReader folder saved",
+            f"Dolphin EasyReader folder saved:\n\n{folder}"
+        )
+        return folder
+
+    def get_dolphin_easyreader_folder(self):
+        folder = self.db.get_setting("dolphin_easyreader_folder", "")
+        if folder and Path(folder).exists():
+            return folder
+
+        messagebox.showinfo(
+            "Choose Dolphin EasyReader folder",
+            "Choose the Dolphin EasyReader import or library folder where books should be copied."
+        )
+        return self.choose_dolphin_easyreader_folder()
+
+    def send_to_dolphin_easyreader(self):
+        self.copy_selected_books_to_folder_target(
+            app_name="Dolphin EasyReader",
+            folder_name="Dolphin EasyReader folder",
+            folder_getter=self.get_dolphin_easyreader_folder,
+            setting_key="dolphin_easyreader_folder",
+        )
+
+    def copy_selected_books_to_folder_target(self, app_name, folder_name, folder_getter, setting_key):
+        book_ids = self.selected_book_ids()
+        if not book_ids:
             return
 
-        row = self.db.get_book(book_id)
-        if not row:
-            messagebox.showerror("Book not found", "The selected book was not found.")
+        rows = [self.db.get_book(book_id) for book_id in book_ids]
+        rows = [row for row in rows if row]
+        if not rows:
+            messagebox.showerror("Book not found", "The selected book or books were not found.")
             return
 
-        source = Path(row[8])
-        if not source.exists():
-            messagebox.showerror(
-                "Book file missing",
-                "The stored book file could not be found, so it cannot be sent to Voice Dream."
-            )
+        target_folder = folder_getter()
+        if not target_folder:
             return
 
-        loader_folder = self.get_voice_dream_folder()
-        if not loader_folder:
-            return
-
-        destination_folder = Path(loader_folder)
+        destination_folder = Path(target_folder)
         if not destination_folder.exists():
             messagebox.showerror(
                 "Folder missing",
-                "The Voice Dream Loader folder does not exist. Please choose it again."
+                f"The {folder_name} does not exist. Please choose it again."
             )
-            self.db.set_setting("voice_dream_loader_folder", "")
+            self.db.set_setting(setting_key, "")
             return
 
-        destination = destination_folder / source.name
-        if destination.exists():
-            replace = messagebox.askyesno(
-                "Replace existing file",
-                f"{destination.name} already exists in the Voice Dream Loader folder. Replace it?"
-            )
-            if not replace:
-                return
+        sent = 0
+        skipped = []
+        for row in rows:
+            source = Path(row[8])
+            if not source.exists():
+                skipped.append(f"{row[1]}: stored file missing")
+                continue
 
-        try:
-            shutil.copy2(source, destination)
-        except Exception as exc:
-            messagebox.showerror(
-                "Send to Voice Dream failed",
-                f"Could not copy the book to the Voice Dream Loader folder.\n\n{exc}"
-            )
-            return
+            destination = destination_folder / source.name
+            if destination.exists():
+                replace = messagebox.askyesno(
+                    "Replace existing file",
+                    f"{destination.name} already exists in the {folder_name}. Replace it?"
+                )
+                if not replace:
+                    skipped.append(f"{row[1]}: skipped because the file already exists")
+                    continue
 
-        self.status_var.set(f"Sent to Voice Dream: {source.name}")
-        messagebox.showinfo(
-            "Sent to Voice Dream",
-            f"Copied this book to the Voice Dream Loader folder:\n\n{destination}"
-        )
+            try:
+                shutil.copy2(source, destination)
+                sent += 1
+            except Exception as exc:
+                skipped.append(f"{row[1]}: {exc}")
+
+        self.status_var.set(f"Sent {sent} book{'s' if sent != 1 else ''} to {app_name}.")
+        if skipped:
+            messagebox.showwarning(
+                f"Send to {app_name} finished with warnings",
+                f"Copied {sent} book{'s' if sent != 1 else ''} to the {folder_name}.\n\n"
+                + "\n".join(skipped[:20])
+            )
+        else:
+            messagebox.showinfo(
+                f"Sent to {app_name}",
+                f"Copied {sent} book{'s' if sent != 1 else ''} to the {folder_name}."
+            )
 
     def export_book(self):
         book_ids = self.selected_book_ids()
@@ -5008,7 +7190,10 @@ catch {
             "Control+Shift+N: Import a folder of books, including Bookshare ZIP files.\n"
             "F2: Edit selected book metadata. On Windows, the metadata editor uses native edit boxes so screen readers can read field names, contents, and typed text. Use Tab and Shift+Tab to move between fields.\n"
             "Control+D: Auto-detect metadata from the selected book.\n"
-            "Use Book, Check EPUB Accessibility Metadata, to inspect the selected EPUB for package accessibility metadata, navigation, page list, heading structure, language, and image alt text coverage.\n"
+            "Use Book, Repair, Check EPUB Accessibility Metadata, to inspect the selected EPUB for package accessibility metadata, navigation, page list, heading structure, language, and image alt text coverage.\n"
+            "Use Book, Repair, Add EPUB Page Breaks from Page Labels, to repair an already-imported EPUB that has written page labels like Page 277 or age 277 but no real page-break markers.\n"
+            "Use Book, Repair, Rebuild EPUB Table of Contents from Text TOC, to align EPUB navigation with a text table of contents when page-break anchors are available.\n"
+            "Use Book, Repair, Clean Repaired EPUB Text, to remove obvious repeated headers or footers, remove blank-page notices, auto-detect missing language metadata, and add page breaks from page labels.\n"
             "Use the Book menu, Look Up Book Metadata from Internet, to search Open Library and Google Books for metadata.\n"
             "Use the Book menu, View Cover Image, to open a visual cover image when one is available or look one up online.\n"
             "Enter or Control+O: Open selected book.\n"
@@ -5016,6 +7201,7 @@ catch {
             "Control+R: Convert selected book to EPUB.\n"
             "Control+Shift+K: Send selected book to Kindle.\n"
             "Control+Shift+V: Send selected book to Voice Dream Loader folder.\n"
+            "Use File, Send To, Dolphin EasyReader, to copy the selected book or selected books to a Dolphin EasyReader import or library folder.\n"
             "Control+Shift+E: Send selected book to an NLS eReader if it is connected.\n"
             "Use File, Send To, HumanWare Braille eReader MTP, for HumanWare devices that appear under This PC but do not have a normal drive letter.\n"
             "Control+Space: Select or unselect the current book for batch actions. Kindle, Export, and Delete use selected books when any are selected.\n"
@@ -5025,6 +7211,7 @@ catch {
             "Delete: Remove selected book from library.\n"
             "Control+F: Search library metadata.\n"
             "Escape: Clear the current search and return to the full book list.\n"
+            "Home and End: Move to the first or last shown book.\n"
             "Control+I: Show book details.\n"
             "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads edition, Alt+4 reads year, Alt+5 reads ISBN, Alt+6 reads publisher, Alt+7 reads source, Alt+8 reads tags, Alt+9 reads format, and Alt+0 reads date added. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
             "Use Organize, Sort, to sort title or author A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
@@ -5032,7 +7219,8 @@ catch {
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
             "Use Settings, Book List Reading, to choose title only, title and author, title author and edition, or all details.\n"
             "Use Settings, Missing Metadata Alert Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
-            "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local database is lost.\n"
+            "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database and imported book file backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local library is lost.\n"
+            "Use Settings, Watched Folders, to add folders that are scanned automatically for new or changed ebook files.\n"
             "Use Settings, File Explorer Integration, to add or remove a Windows right-click command for adding supported files directly from File Explorer.\n"
             "If NVDA is running and its controller is available, the app automatically uses NVDA book list announcements. No setting is needed.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
