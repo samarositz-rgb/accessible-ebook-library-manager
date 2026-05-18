@@ -18,14 +18,15 @@ Features:
 This app does not remove DRM. It manages files you are allowed to copy and read.
 """
 
+import logging
 import os
 import filecmp
 import shutil
 import sqlite3
 import subprocess
 import sys
-import traceback
 import zipfile
+from logging.handlers import RotatingFileHandler
 import re
 import html
 import posixpath
@@ -65,6 +66,8 @@ from tkinter import (
 from tkinter import ttk
 from xml.etree import ElementTree as ET
 
+
+logger = logging.getLogger(__name__)
 
 APP_NAME = "Accessible Ebook Library Manager"
 DB_NAME = "library.db"
@@ -125,6 +128,7 @@ ET.register_namespace("opf", OPF_NS)
 ET.register_namespace("dc", DC_NS)
 
 WINDOWS_NO_CONSOLE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SCHEMA_VERSION = 2
 
 
 def find_nvda_controller_dll() -> Path | None:
@@ -324,8 +328,15 @@ class LibraryDatabase:
             )
             """
         )
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_title ON books(title COLLATE NOCASE)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_author ON books(author COLLATE NOCASE)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_format ON books(format)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_year ON books(year)")
         self.connection.commit()
-        self.ensure_book_columns()
+        if int(self.get_setting("schema_version", "0")) < SCHEMA_VERSION:
+            self.ensure_book_columns()
+            self.set_setting("schema_version", str(SCHEMA_VERSION))
 
     def ensure_book_columns(self):
         """Add newer metadata columns to existing libraries without deleting data."""
@@ -4647,14 +4658,7 @@ class LibraryApp:
         return self.db.folder / "crash_log.txt"
 
     def log_error(self, context, exc):
-        try:
-            with open(self.crash_log_path(), "a", encoding="utf-8") as log:
-                log.write("\n" + "=" * 60 + "\n")
-                log.write(f"Context: {context}\n")
-                log.write(traceback.format_exc())
-                log.write("\n")
-        except Exception:
-            pass
+        logger.exception(context)
 
     def safe_message_error(self, title, message):
         try:
@@ -7366,20 +7370,23 @@ catch {
         )
 
 
+def _setup_logging():
+    log_path = app_data_folder() / "crash_log.txt"
+    handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s"))
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+
+
 def main():
+    _setup_logging()
     try:
         root = Tk()
         LibraryApp(root)
         root.mainloop()
     except Exception:
+        logger.exception("Fatal application crash")
         try:
-            folder = app_data_folder()
-            log_path = folder / "crash_log.txt"
-            with open(log_path, "a", encoding="utf-8") as log:
-                log.write("\n" + "=" * 60 + "\n")
-                log.write("Fatal application crash\n")
-                log.write(traceback.format_exc())
-                log.write("\n")
+            log_path = app_data_folder() / "crash_log.txt"
             messagebox.showerror(
                 "Application error",
                 f"The app hit an unexpected error.\n\nCrash details saved at:\n{log_path}"
