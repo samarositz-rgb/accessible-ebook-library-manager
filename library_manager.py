@@ -316,6 +316,14 @@ class LibraryDatabase:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
+                book_text,
+                tokenize='porter unicode61'
+            )
+            """
+        )
         self.connection.commit()
         self.ensure_book_columns()
 
@@ -334,6 +342,7 @@ class LibraryDatabase:
             "accessibility_access_modes": "TEXT DEFAULT ''",
             "accessibility_access_modes_sufficient": "TEXT DEFAULT ''",
             "accessibility_certified_by": "TEXT DEFAULT ''",
+            "content_indexed_at": "TEXT DEFAULT NULL",
         }
         for name, column_type in columns.items():
             if name not in existing:
@@ -366,6 +375,48 @@ class LibraryDatabase:
 
     def close(self):
         self.connection.close()
+
+    def index_book_content(self, book_id: int, text: str):
+        self.connection.execute("DELETE FROM books_fts WHERE rowid = ?", (book_id,))
+        if text.strip():
+            self.connection.execute(
+                "INSERT INTO books_fts(rowid, book_text) VALUES (?, ?)",
+                (book_id, text[:500_000]),
+            )
+        self.connection.execute(
+            "UPDATE books SET content_indexed_at = ? WHERE id = ?",
+            (utc_now_text(), book_id),
+        )
+        self.connection.commit()
+
+    def search_content(self, query: str) -> set:
+        if not query.strip():
+            return set()
+        tokens = re.findall(r"\S+", query)
+        fts_query = " ".join(f'"{token}"' for token in tokens)
+        try:
+            cursor = self.connection.execute(
+                "SELECT rowid FROM books_fts WHERE books_fts MATCH ?",
+                (fts_query,),
+            )
+            return {row[0] for row in cursor.fetchall()}
+        except Exception:
+            return set()
+
+    def get_unindexed_books(self) -> list:
+        cursor = self.connection.execute(
+            """
+            SELECT id, stored_path FROM books
+            WHERE content_indexed_at IS NULL
+            ORDER BY added_at DESC
+            """
+        )
+        return cursor.fetchall()
+
+    def clear_all_content_index(self):
+        self.connection.execute("DELETE FROM books_fts")
+        self.connection.execute("UPDATE books SET content_indexed_at = NULL")
+        self.connection.commit()
 
     def add_book(self, title, author, source, tags, notes, original_path, stored_path):
         ext = Path(stored_path).suffix.lower().replace(".", "")
@@ -443,6 +494,7 @@ class LibraryDatabase:
                     os.remove(stored_path)
             except OSError:
                 pass
+        self.connection.execute("DELETE FROM books_fts WHERE rowid = ?", (book_id,))
         self.connection.execute("DELETE FROM books WHERE id = ?", (book_id,))
         self.connection.commit()
 
@@ -485,7 +537,7 @@ class LibraryDatabase:
         )
         return cursor.fetchone()
 
-    def search_books(self, query="", sort_by="title", source_filter="", tag_filter="", format_filter=""):
+    def search_books(self, query="", sort_by="title", source_filter="", tag_filter="", format_filter="", extra_ids=None):
         query = query.strip()
         source_filter = source_filter.strip()
         tag_filter = tag_filter.strip()
@@ -508,27 +560,32 @@ class LibraryDatabase:
 
         if query:
             like = f"%{query}%"
-            conditions.append(
-                """(
-                   title LIKE ?
-                   OR author LIKE ?
-                   OR source LIKE ?
-                   OR tags LIKE ?
-                   OR notes LIKE ?
-                   OR format LIKE ?
-                   OR edition LIKE ?
-                   OR year LIKE ?
-                   OR isbn LIKE ?
-                   OR publisher LIKE ?
-                   OR accessibility_summary LIKE ?
-                   OR accessibility_features LIKE ?
-                   OR accessibility_hazards LIKE ?
-                   OR accessibility_access_modes LIKE ?
-                   OR accessibility_access_modes_sufficient LIKE ?
-                   OR accessibility_certified_by LIKE ?
-                )"""
+            metadata_condition = (
+                "(title LIKE ?"
+                " OR author LIKE ?"
+                " OR source LIKE ?"
+                " OR tags LIKE ?"
+                " OR notes LIKE ?"
+                " OR format LIKE ?"
+                " OR edition LIKE ?"
+                " OR year LIKE ?"
+                " OR isbn LIKE ?"
+                " OR publisher LIKE ?"
+                " OR accessibility_summary LIKE ?"
+                " OR accessibility_features LIKE ?"
+                " OR accessibility_hazards LIKE ?"
+                " OR accessibility_access_modes LIKE ?"
+                " OR accessibility_access_modes_sufficient LIKE ?"
+                " OR accessibility_certified_by LIKE ?)"
             )
-            params.extend([like] * 16)
+            if extra_ids:
+                placeholders = ",".join("?" * len(extra_ids))
+                conditions.append(f"({metadata_condition} OR id IN ({placeholders}))")
+                params.extend([like] * 16)
+                params.extend(extra_ids)
+            else:
+                conditions.append(metadata_condition)
+                params.extend([like] * 16)
 
         if source_filter:
             conditions.append("source LIKE ?")
@@ -1046,6 +1103,22 @@ def read_text_for_metadata_detection(path: Path, max_chars: int = 50000) -> str:
     suffix = path.suffix.lower()
     if suffix == ".epub":
         return read_text_from_epub(path, max_chars=max_chars)
+    if suffix == ".docx":
+        return read_text_from_docx(path, max_chars=max_chars)
+    if suffix == ".doc":
+        return read_text_from_legacy_doc(path, max_chars=max_chars)
+    if suffix == ".pdf":
+        return read_text_from_pdf(path, max_chars=max_chars)
+    if suffix in {".txt", ".rtf", ".html", ".htm"}:
+        return read_text_from_plain_file(path, max_chars=max_chars)
+    return ""
+
+
+def extract_text_for_indexing(path: Path) -> str:
+    suffix = path.suffix.lower()
+    max_chars = 500_000
+    if suffix == ".epub":
+        return read_text_from_epub_preserve_lines(path, max_chars=max_chars)
     if suffix == ".docx":
         return read_text_from_docx(path, max_chars=max_chars)
     if suffix == ".doc":
@@ -2689,6 +2762,8 @@ class LibraryApp:
         self.backup_check_after = None
         self.watched_scan_after = None
         self.watched_scan_running = False
+        self._index_queue = queue.Queue()
+        self._start_content_indexer()
 
         self.build_menu()
         self.build_ui()
@@ -2762,10 +2837,12 @@ class LibraryApp:
         menu_bar.add_cascade(label="Organize", menu=organize_menu, underline=0)
 
         search_menu = Menu(menu_bar, tearoff=False)
-        search_menu.add_command(label="Search Library Metadata...\tCtrl+F", command=self.focus_search)
+        search_menu.add_command(label="Search Library...\tCtrl+F", command=self.focus_search)
         search_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
         search_menu.add_command(label="Clear Search", command=self.clear_search)
         search_menu.add_command(label="Explain Search", command=self.explain_search)
+        search_menu.add_separator()
+        search_menu.add_command(label="Re-index Book Content...", command=self.reindex_library_content)
         menu_bar.add_cascade(label="Search", menu=search_menu, underline=0)
 
         settings_menu = Menu(menu_bar, tearoff=False)
@@ -3567,6 +3644,50 @@ class LibraryApp:
         changed = db_mtime != backed_mtime or book_signature != backed_book_signature
         return changed and datetime.utcnow() - last_backup >= interval
 
+    def _start_content_indexer(self):
+        threading.Thread(target=self._content_index_worker, daemon=True).start()
+
+    def _content_index_worker(self):
+        while True:
+            try:
+                book_id, stored_path = self._index_queue.get(timeout=10)
+                self._index_one_book(book_id, stored_path)
+                self._index_queue.task_done()
+            except queue.Empty:
+                unindexed = self.db.get_unindexed_books()
+                for book_id, stored_path in unindexed[:5]:
+                    self._index_one_book(book_id, stored_path)
+
+    def _index_one_book(self, book_id: int, stored_path: str):
+        try:
+            path = Path(stored_path)
+            if not path.exists():
+                return
+            text = extract_text_for_indexing(path)
+            self.db.index_book_content(book_id, text)
+        except Exception:
+            pass
+
+    def queue_book_for_indexing(self, book_id: int, stored_path: str):
+        self._index_queue.put((book_id, stored_path))
+
+    def reindex_library_content(self):
+        answer = messagebox.askyesno(
+            "Re-index Library Content",
+            "This will re-index the text content of all books so they can be found by search. "
+            "Indexing runs in the background and may take several minutes for large libraries. "
+            "You can continue using the app while it runs.\n\nContinue?",
+        )
+        if not answer:
+            return
+        self.db.clear_all_content_index()
+        self.status_var.set("Content re-indexing started in background.")
+        messagebox.showinfo(
+            "Re-indexing started",
+            "Library content re-indexing has started in the background. "
+            "Search will include book content as indexing progresses.",
+        )
+
     def schedule_backup_check(self, delay_ms=None):
         if self.backup_check_after is not None:
             try:
@@ -4153,10 +4274,10 @@ class LibraryApp:
     def focus_search(self):
         value = AccessibleSingleFieldDialog.ask(
             self.root,
-            "Search Library Metadata",
-            "Enter text to search in title, author, source, tags, format, notes, edition, year, ISBN, and publisher. Leave blank to show all books.",
+            "Search Library",
+            "Enter text to search in title, author, source, tags, format, notes, edition, year, ISBN, publisher, and book content. Leave blank to show all books.",
             self.search_var.get(),
-            heading="Search Library Metadata",
+            heading="Search Library",
         )
         if value is None:
             self.focus_books_list()
@@ -4367,9 +4488,11 @@ class LibraryApp:
 
     def explain_search(self):
         messagebox.showinfo(
-            "Search Library Metadata",
-            "Search looks through library metadata only: title, author, source, tags, format, notes, edition, year, ISBN, and publisher.\n\n"
-            "It does not search inside the full text of every book yet."
+            "Search Library",
+            "Search looks through both library metadata and the full text content of your books.\n\n"
+            "Metadata searched: title, author, source, tags, format, notes, edition, year, ISBN, and publisher.\n\n"
+            "Book content is indexed in the background when you add books. "
+            "If a book was added before content indexing was available, use Search, Re-index Book Content to index your existing library."
         )
 
     def search_and_focus(self):
@@ -4386,12 +4509,15 @@ class LibraryApp:
         self.book_list_ids = []
         self.book_list_titles = []
 
+        query = self.search_var.get()
+        content_ids = self.db.search_content(query) if query.strip() else None
         rows = self.db.search_books(
-            self.search_var.get(),
+            query,
             sort_by=self.sort_by,
             source_filter=self.filter_source,
             tag_filter=self.filter_tag,
             format_filter=self.filter_format,
+            extra_ids=content_ids,
         )
         for row in rows:
             book_id = row[0]
@@ -4795,6 +4921,7 @@ class LibraryApp:
             metadata.get("publisher", ""),
         )
         self.update_accessibility_from_epub(new_book_id, destination)
+        self.queue_book_for_indexing(new_book_id, str(destination))
         return True
 
     def import_folder(self):
@@ -5081,6 +5208,7 @@ class LibraryApp:
             metadata.get("publisher", ""),
         )
         self.update_accessibility_from_epub(new_book_id, destination)
+        self.queue_book_for_indexing(new_book_id, str(destination))
         return 1
 
     def create_combined_epub(self, destination: Path, readable_parts, metadata, root_folder: Path | None = None):
@@ -5403,6 +5531,7 @@ class LibraryApp:
                 metadata.get("publisher", ""),
             )
             self.update_accessibility_from_epub(new_book_id, destination)
+            self.queue_book_for_indexing(new_book_id, str(destination))
             added += 1
 
         self.refresh_books()
@@ -6315,6 +6444,7 @@ class LibraryApp:
         new_book_id = self.db.add_book(row[1], row[2], row[3], row[4], row[5], str(source_file), str(output_path))
         self.db.update_extra_fields(new_book_id, row[10], row[11], row[12], row[13])
         self.update_accessibility_from_epub(new_book_id, output_path)
+        self.queue_book_for_indexing(new_book_id, str(output_path))
         self.refresh_books()
         self.focus_books_list()
         messagebox.showinfo("Conversion complete", "The EPUB was created and added to your library.")
