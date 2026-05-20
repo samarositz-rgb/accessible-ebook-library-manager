@@ -66,6 +66,26 @@ from tkinter import (
 from tkinter import ttk
 from xml.etree import ElementTree as ET
 
+from document_text import (
+    detect_language_from_text,
+    extract_text_for_indexing,
+    read_text_from_epub_preserve_lines,
+    read_text_for_metadata_detection,
+    strip_xml_html_tags,
+    strip_xml_html_tags_preserve_lines,
+)
+from library_utils import (
+    folder_file_stats,
+    metadata_score_from_detection,
+    metadata_score_from_row,
+    normalize_duplicate_key,
+    normalize_isbn_key,
+    replace_folder_from_backup,
+    safe_filename,
+    sync_folder_contents,
+    title_keys_look_same,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -208,72 +228,6 @@ def parse_utc_text(value):
 
 def cloud_backup_subfolder(base_folder: Path) -> Path:
     return base_folder / "Accessible Ebook Library Manager Backups"
-
-
-def folder_file_stats(folder: Path) -> tuple[int, int]:
-    if not folder or not folder.exists():
-        return 0, 0
-    file_count = 0
-    byte_count = 0
-    for path in folder.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            byte_count += path.stat().st_size
-            file_count += 1
-        except OSError:
-            continue
-    return file_count, byte_count
-
-
-def files_need_copy(source: Path, destination: Path) -> bool:
-    if not destination.exists():
-        return True
-    try:
-        source_stat = source.stat()
-        destination_stat = destination.stat()
-    except OSError:
-        return True
-    return (
-        source_stat.st_size != destination_stat.st_size
-        or int(source_stat.st_mtime) != int(destination_stat.st_mtime)
-    )
-
-
-def sync_folder_contents(source_folder: Path, destination_folder: Path):
-    source_folder.mkdir(parents=True, exist_ok=True)
-    destination_folder.mkdir(parents=True, exist_ok=True)
-    source_files = set()
-
-    for source_path in source_folder.rglob("*"):
-        relative = source_path.relative_to(source_folder)
-        destination_path = destination_folder / relative
-        if source_path.is_dir():
-            destination_path.mkdir(parents=True, exist_ok=True)
-            continue
-        if not source_path.is_file():
-            continue
-        source_files.add(relative)
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        if files_need_copy(source_path, destination_path):
-            shutil.copy2(source_path, destination_path)
-
-    for destination_path in sorted(destination_folder.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        relative = destination_path.relative_to(destination_folder)
-        if destination_path.is_file() and relative not in source_files:
-            destination_path.unlink()
-        elif destination_path.is_dir():
-            try:
-                destination_path.rmdir()
-            except OSError:
-                pass
-
-
-def replace_folder_from_backup(backup_folder: Path, target_folder: Path):
-    if not backup_folder.exists() or not backup_folder.is_dir():
-        return
-    target_folder.mkdir(parents=True, exist_ok=True)
-    sync_folder_contents(backup_folder, target_folder)
 
 
 def app_launch_command_for_file_argument():
@@ -626,19 +580,6 @@ class LibraryDatabase:
         )
         return cursor.fetchall()
 
-def safe_filename(text: str) -> str:
-    bad = '<>:"/\\|?*'
-    cleaned = "".join("_" if ch in bad else ch for ch in text).strip()
-    return cleaned or "Untitled"
-
-
-def normalize_duplicate_key(text: str) -> str:
-    text = (text or "").casefold()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    text = re.sub(r"\b(?:the|a|an)\b", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def first_or_empty(root, xpath, namespaces):
     item = root.find(xpath, namespaces)
     if item is None or item.text is None:
@@ -882,290 +823,6 @@ def write_epub_metadata(epub_path: Path, title: str, author: str, source: str, t
     os.replace(temp_path, epub_path)
 
 
-def strip_xml_html_tags(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def strip_xml_html_tags_preserve_lines(text: str) -> str:
-    text = re.sub(r"<\s*(?:br|/p|/h[1-6]|/li|/div|/section|/nav)\b[^>]*>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
-    lines = [re.sub(r"\s+", " ", html.unescape(line)).strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
-    chunks = []
-    try:
-        with zipfile.ZipFile(epub_path, "r") as archive:
-            names = archive.namelist()
-            text_names = [
-                name for name in names
-                if name.lower().endswith((".xhtml", ".html", ".htm", ".xml"))
-                and "nav" not in name.lower()
-                and "toc" not in name.lower()
-                and "container.xml" not in name.lower()
-            ]
-
-            for name in text_names[:35]:
-                try:
-                    raw = archive.read(name)
-                    decoded = raw.decode("utf-8", errors="ignore")
-                    cleaned = strip_xml_html_tags(decoded)
-                    if cleaned:
-                        chunks.append(cleaned)
-                    if sum(len(chunk) for chunk in chunks) >= max_chars:
-                        break
-                except Exception:
-                    continue
-    except Exception:
-        return ""
-
-    return "\n".join(chunks)[:max_chars]
-
-
-def read_text_from_epub_preserve_lines(epub_path: Path, max_chars: int = 50000) -> str:
-    chunks = []
-    try:
-        with zipfile.ZipFile(epub_path, "r") as archive:
-            names = archive.namelist()
-            text_names = [
-                name for name in names
-                if name.lower().endswith((".xhtml", ".html", ".htm", ".xml"))
-                and "nav" not in name.lower()
-                and "toc" not in name.lower()
-                and "container.xml" not in name.lower()
-            ]
-
-            for name in text_names[:80]:
-                try:
-                    decoded = archive.read(name).decode("utf-8", errors="ignore")
-                    cleaned = strip_xml_html_tags_preserve_lines(decoded)
-                    if cleaned:
-                        chunks.append(cleaned)
-                    if sum(len(chunk) for chunk in chunks) >= max_chars:
-                        break
-                except Exception:
-                    continue
-    except Exception:
-        return ""
-
-    return "\n".join(chunks)[:max_chars]
-
-
-def read_text_from_docx(docx_path: Path, max_chars: int = 50000) -> str:
-    try:
-        with zipfile.ZipFile(docx_path, "r") as archive:
-            raw = archive.read("word/document.xml")
-        root = ET.fromstring(raw)
-        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        paragraphs = []
-        for paragraph in root.findall(".//w:p", ns):
-            parts = []
-            for element in paragraph.iter():
-                tag = element.tag.rsplit("}", 1)[-1]
-                if tag == "t" and element.text:
-                    parts.append(element.text)
-                elif tag == "tab":
-                    parts.append(" ")
-                elif tag in {"br", "cr"}:
-                    parts.append("\n")
-            text = "".join(parts).strip()
-            if text:
-                paragraphs.append(text)
-            if sum(len(item) for item in paragraphs) >= max_chars:
-                break
-        if paragraphs:
-            return "\n\n".join(paragraphs)[:max_chars]
-        decoded = raw.decode("utf-8", errors="ignore")
-        return strip_xml_html_tags(decoded)[:max_chars]
-    except Exception:
-        return ""
-
-
-def read_text_from_legacy_doc(doc_path: Path, max_chars: int = 50000) -> str:
-    if not sys.platform.startswith("win") or not shutil.which("powershell"):
-        return ""
-
-    script = r"""
-$ErrorActionPreference = 'Stop'
-$path = $args[0]
-$maxChars = [int]$args[1]
-$word = $null
-$doc = $null
-try {
-    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-    $word = New-Object -ComObject Word.Application
-    $word.Visible = $false
-    $word.DisplayAlerts = 0
-    $doc = $word.Documents.Open($path, $false, $true, $false)
-    $text = [string]$doc.Content.Text
-    if ($text.Length -gt $maxChars) {
-        $text = $text.Substring(0, $maxChars)
-    }
-    [Console]::Write($text)
-}
-finally {
-    if ($doc -ne $null) {
-        $doc.Close($false) | Out-Null
-    }
-    if ($word -ne $null) {
-        $word.Quit() | Out-Null
-    }
-    [GC]::Collect()
-    [GC]::WaitForPendingFinalizers()
-}
-"""
-    try:
-        with tempfile.TemporaryDirectory(prefix="aelm_doc_extract_") as temp_folder:
-            script_path = Path(temp_folder) / "extract_doc_text.ps1"
-            script_path.write_text(script, encoding="utf-8")
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-File",
-                    str(script_path),
-                    str(doc_path),
-                    str(max_chars),
-                ],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                creationflags=WINDOWS_NO_CONSOLE_FLAGS,
-                timeout=90,
-            )
-        if completed.returncode != 0:
-            return ""
-        return re.sub(r"\r\n?|\v|\f", "\n", completed.stdout or "")[:max_chars]
-    except Exception:
-        return ""
-
-
-def read_text_from_plain_file(path: Path, max_chars: int = 50000) -> str:
-    try:
-        raw = path.read_bytes()[:max_chars * 2]
-        return raw.decode("utf-8", errors="ignore")[:max_chars]
-    except Exception:
-        return ""
-
-
-def read_metadata_text_from_pdf(pdf_path: Path, max_chars: int = 12000) -> str:
-    try:
-        raw = pdf_path.read_bytes()[: max_chars * 20]
-    except Exception:
-        return ""
-
-    text = raw.decode("latin-1", errors="ignore")
-    lines = []
-    for key in ["Title", "Author", "Subject", "Keywords", "Creator", "Producer"]:
-        for match in re.finditer(rf"/{key}\s*\((.*?)\)", text, flags=re.DOTALL):
-            value = match.group(1)
-            value = value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
-            value = re.sub(r"\s+", " ", value).strip()
-            if value:
-                lines.append(f"{key}: {value}")
-    return "\n".join(lines)[:max_chars]
-
-
-def read_text_from_pdf(pdf_path: Path, max_chars: int = 50000) -> str:
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
-
-    chunks = []
-    try:
-        reader = PdfReader(str(pdf_path))
-        metadata = reader.metadata or {}
-        for label, key in [
-            ("Title", "/Title"),
-            ("Author", "/Author"),
-            ("Subject", "/Subject"),
-            ("Keywords", "/Keywords"),
-        ]:
-            value = metadata.get(key)
-            if value:
-                chunks.append(f"{label}: {value}")
-
-        for page in reader.pages:
-            try:
-                page_text = page.extract_text() or ""
-            except Exception:
-                page_text = ""
-            if page_text.strip():
-                chunks.append(page_text)
-            if sum(len(chunk) for chunk in chunks) >= max_chars:
-                break
-    except Exception:
-        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
-
-    text = "\n\n".join(chunks).strip()
-    if not text:
-        return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
-    return text[:max_chars]
-
-
-def read_text_for_metadata_detection(path: Path, max_chars: int = 50000) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".epub":
-        return read_text_from_epub(path, max_chars=max_chars)
-    if suffix == ".docx":
-        return read_text_from_docx(path, max_chars=max_chars)
-    if suffix == ".doc":
-        return read_text_from_legacy_doc(path, max_chars=max_chars)
-    if suffix == ".pdf":
-        return read_text_from_pdf(path, max_chars=max_chars)
-    if suffix in {".txt", ".rtf", ".html", ".htm"}:
-        return read_text_from_plain_file(path, max_chars=max_chars)
-    return ""
-
-
-def extract_text_for_indexing(path: Path) -> str:
-    suffix = path.suffix.lower()
-    max_chars = 500_000
-    if suffix == ".epub":
-        return read_text_from_epub_preserve_lines(path, max_chars=max_chars)
-    if suffix == ".docx":
-        return read_text_from_docx(path, max_chars=max_chars)
-    if suffix == ".doc":
-        return read_text_from_legacy_doc(path, max_chars=max_chars)
-    if suffix == ".pdf":
-        return read_text_from_pdf(path, max_chars=max_chars)
-    if suffix in {".txt", ".rtf", ".html", ".htm"}:
-        return read_text_from_plain_file(path, max_chars=max_chars)
-    return ""
-
-
-def detect_language_from_text(text: str, default: str = "en") -> str:
-    sample = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' ]+", " ", text or "").casefold()
-    words = re.findall(r"[a-zÀ-ÖØ-öø-ÿ']+", sample[:200000])
-    if not words:
-        return default
-
-    word_set = set(words)
-    language_markers = {
-        "en": {"the", "and", "of", "to", "in", "that", "is", "for", "with", "as", "was", "are", "by", "from", "this"},
-        "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del"},
-        "fr": {"le", "la", "les", "de", "des", "que", "et", "en", "un", "une", "pour", "avec", "est", "dans", "du"},
-        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "für"},
-        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "è", "del", "della"},
-        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "é", "do", "da"},
-    }
-    scores = {}
-    for language, markers in language_markers.items():
-        scores[language] = sum(1 for marker in markers if marker in word_set)
-
-    best_language, best_score = max(scores.items(), key=lambda item: item[1])
-    if best_score < 3:
-        return default
-    return best_language
-
-
 def natural_sort_key(path: Path):
     parts = re.split(r"(\d+)", path.name.casefold())
     return [int(part) if part.isdigit() else part for part in parts]
@@ -1257,9 +914,9 @@ def looks_like_standalone_heading_line(line: str):
         return False
     if re.match(r"^(?:chapter|part|section|appendix|index|front matter)\b", normalized, flags=re.IGNORECASE):
         return True
-    if re.match(r"^(?:§|Â§)+\s*\d+(?:\.\d+)*\.?\s+\S+", normalized):
+    if re.match(r"^(?:Â§|Ã‚Â§)+\s*\d+(?:\.\d+)*\.?\s+\S+", normalized):
         return True
-    if re.match(r"^[A-Z][A-Z0-9 ,;:'’\-\(\)&]{5,}$", normalized) and len(normalized.split()) <= 12:
+    if re.match(r"^[A-Z][A-Z0-9 ,;:'â€™\-\(\)&]{5,}$", normalized) and len(normalized.split()) <= 12:
         return True
     return False
 
@@ -1274,7 +931,7 @@ def looks_like_heading_continuation_line(line: str):
         return False
     if re.search(r"\b(the|and|or|but|with|from|into|after|before|because|that|this|will|shall|must|have|has|was|were|are|is)\b", normalized, flags=re.IGNORECASE):
         return False
-    return bool(re.match(r"^[A-Z0-9§Â§][A-Za-z0-9§Â§ ,'\u2019\-\(\)&:]+$", normalized))
+    return bool(re.match(r"^[A-Z0-9Â§Ã‚Â§][A-Za-z0-9Â§Ã‚Â§ ,'\u2019\-\(\)&:]+$", normalized))
 
 
 def is_blank_page_notice(line: str):
@@ -1355,7 +1012,7 @@ def cleaned_lines_for_reflow(text: str):
 def clean_metadata_line(line: str) -> str:
     line = line.strip()
     line = re.sub(r"\s+", " ", line)
-    line = re.sub(r"^[#*\\-–—: ]+", "", line)
+    line = re.sub(r"^[#*\\-â€“â€”: ]+", "", line)
     return line.strip()
 
 
@@ -3110,8 +2767,8 @@ class LibraryApp:
     def duplicate_group_key(self, row):
         title_key = normalize_duplicate_key(row[1])
         author_key = normalize_duplicate_key(row[2])
-        isbn_key = re.sub(r"[^0-9Xx]", "", row[12] or "").casefold()
-        if len(isbn_key) in {10, 13}:
+        isbn_key = normalize_isbn_key(row[12] or "")
+        if isbn_key:
             return ("isbn", isbn_key)
         if title_key and author_key:
             return ("title_author", title_key, author_key)
@@ -4057,8 +3714,14 @@ class LibraryApp:
                 yield None, f"{folder} -- {exc}"
 
     def is_ignored_watched_file(self, path: Path):
+        return self.is_ignored_import_file(path)
+
+    def is_ignored_import_file(self, path: Path):
         if not path.is_file():
             return False
+
+        if path.stem.casefold().startswith("quickstart"):
+            return True
 
         if path.name.casefold() in {
             "please do not delete this file.txt",
@@ -4128,6 +3791,58 @@ class LibraryApp:
                 continue
         return None
 
+    def watched_file_matches_existing_metadata(self, source_path: Path):
+        if source_path.suffix.lower() == ".zip":
+            return None, ""
+
+        detected = self.guess_metadata_from_file(source_path)
+        detected_isbn = normalize_isbn_key(detected.get("isbn", ""))
+        source_title = detected.get("title", "")
+        filename_title = clean_filename_title(source_path)
+        candidate_titles = [title for title in [source_title, filename_title] if title]
+        candidate_title_keys = {normalize_duplicate_key(title) for title in candidate_titles if normalize_duplicate_key(title)}
+        detected_metadata_score = metadata_score_from_detection(detected)
+        source_extension = source_path.suffix.lower().lstrip(".")
+
+        for row in self.db.all_books_for_duplicate_check():
+            row_isbn = normalize_isbn_key(row[12] or "")
+            if detected_isbn and row_isbn and detected_isbn == row_isbn:
+                return row, f"same ISBN {detected_isbn}"
+
+            row_title_key = normalize_duplicate_key(row[1])
+            if row_title_key and row_title_key in candidate_title_keys:
+                return row, "same normalized title"
+
+            row_metadata_score = metadata_score_from_row(row)
+            allow_richer_metadata_match = row_metadata_score > detected_metadata_score
+            for candidate_title in candidate_titles:
+                if title_keys_look_same(row[1], candidate_title, allow_richer_metadata_match=allow_richer_metadata_match):
+                    if allow_richer_metadata_match:
+                        return row, "same title with richer corrected metadata"
+                    return row, "same likely title"
+
+            path_keys = set()
+            path_titles = []
+            for path_text in [row[7], row[8]]:
+                if not path_text:
+                    continue
+                path = Path(path_text)
+                if source_extension and path.suffix.lower().lstrip(".") != source_extension:
+                    continue
+                path_title = clean_filename_title(path)
+                path_titles.append(path_title)
+                path_keys.add(normalize_duplicate_key(path_title))
+            if candidate_title_keys & path_keys:
+                return row, "same filename title"
+            for path_title in path_titles:
+                for candidate_title in candidate_titles:
+                    if title_keys_look_same(path_title, candidate_title, allow_richer_metadata_match=allow_richer_metadata_match):
+                        if allow_richer_metadata_match:
+                            return row, "same filename title with richer corrected metadata"
+                        return row, "same likely filename title"
+
+        return None, ""
+
     def scan_watched_folders(self, automatic=False):
         if self.watched_scan_running:
             return
@@ -4161,12 +3876,16 @@ class LibraryApp:
                         updated += 1
                     elif self.watched_file_matches_existing_book(path):
                         skipped.append(f"{path} -- already in library")
-                    elif path.suffix.lower() == ".zip":
-                        zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="Watched Folder")
-                        imported += zip_imported
-                        skipped.extend(zip_skipped)
-                    elif self.import_one_book_without_prompt(path, default_source="Watched Folder"):
-                        imported += 1
+                    else:
+                        matched_row, match_reason = self.watched_file_matches_existing_metadata(path)
+                        if matched_row:
+                            skipped.append(f"{path} -- already in library as {matched_row[1]} ({match_reason})")
+                        elif path.suffix.lower() == ".zip":
+                            zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="Watched Folder")
+                            imported += zip_imported
+                            skipped.extend(zip_skipped)
+                        elif self.import_one_book_without_prompt(path, default_source="Watched Folder"):
+                            imported += 1
                     if signature:
                         signatures[canonical] = signature
                 except sqlite3.IntegrityError:
@@ -4876,6 +4595,9 @@ class LibraryApp:
             )
 
     def import_one_book_without_prompt(self, source_path: Path, default_source: str = "") -> bool:
+        if self.is_ignored_import_file(source_path):
+            raise OSError("ignored helper file")
+
         if source_path.suffix.lower() == ".zip":
             imported, skipped = self.import_zip_file_without_prompt(source_path, default_source=default_source)
             if imported:
@@ -4976,7 +4698,9 @@ class LibraryApp:
             supported = []
             for path in candidates:
                 try:
-                    if path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    if self.is_ignored_import_file(path):
+                        skipped_items.append(f"{path} -- ignored helper file")
+                    elif path.suffix.lower() in SUPPORTED_EXTENSIONS:
                         supported.append(path)
                 except Exception as exc:
                     skipped_items.append(f"{path} -- could not check extension: {exc}")
@@ -5368,7 +5092,7 @@ class LibraryApp:
 
             if looks_like_standalone_heading_line(line) or (previous_output_was_heading and looks_like_heading_continuation_line(line)):
                 flush_paragraph()
-                if re.match(r"^(?:chapter|part|section|appendix|index|front matter|§|Â§)", line, flags=re.IGNORECASE) or previous_output_was_heading:
+                if re.match(r"^(?:chapter|part|section|appendix|index|front matter|Â§|Ã‚Â§)", line, flags=re.IGNORECASE) or previous_output_was_heading:
                     output.append(f"    <h2>{html.escape(line)}</h2>")
                     previous_output_was_heading = True
                 else:
@@ -5464,6 +5188,9 @@ class LibraryApp:
         added = 0
         for path in paths:
             source_path = Path(path)
+
+            if self.is_ignored_import_file(source_path):
+                continue
 
             if source_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                 if not messagebox.askyesno(

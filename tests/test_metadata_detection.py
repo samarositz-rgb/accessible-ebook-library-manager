@@ -159,6 +159,84 @@ class MetadataDetectionTests(TestCase):
             self.assertEqual((destination / "nested" / "chapter.txt").read_text(encoding="utf-8"), "chapter")
             self.assertFalse((destination / "old.txt").exists())
 
+    def test_watched_scan_matches_existing_corrected_metadata_by_filename_title(self):
+        class FakeDatabase:
+            def all_books_for_duplicate_check(self):
+                return [
+                    (
+                        7,
+                        "Family Law: Cases, Text, Problems",
+                        "Corrected Author",
+                        "Personal",
+                        "",
+                        "",
+                        "docx",
+                        r"C:\Originals\family_law_cases_text_problems.docx",
+                        r"C:\Library\Corrected Author - Family Law Cases Text Problems.docx",
+                        "2026-05-01T00:00:00Z",
+                        "Fifth Edition",
+                        "",
+                        "",
+                        "LexisNexis",
+                    )
+                ]
+
+        app = library_manager.LibraryApp.__new__(library_manager.LibraryApp)
+        app.db = FakeDatabase()
+        watched_file = Path(r"C:\VoiceDream\Family Law Cases Text Problems.docx")
+
+        with patch.object(library_manager, "read_text_for_metadata_detection", return_value=""):
+            row, reason = app.watched_file_matches_existing_metadata(watched_file)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 7)
+        self.assertIn(reason, {"same normalized title", "same filename title"})
+
+    def test_watched_scan_keeps_richer_corrected_metadata_without_isbn(self):
+        class FakeDatabase:
+            def all_books_for_duplicate_check(self):
+                return [
+                    (
+                        11,
+                        "Family Law: Cases, Text, Problems",
+                        "Corrected Author",
+                        "Bookshare",
+                        "textbook, law",
+                        "metadata corrected by hand",
+                        "docx",
+                        r"C:\Originals\Family Law Cases Text Problems.docx",
+                        r"C:\Library\Corrected Author - Family Law Cases Text Problems.docx",
+                        "2026-05-01T00:00:00Z",
+                        "Fifth Edition",
+                        "2010",
+                        "",
+                        "LexisNexis",
+                    )
+                ]
+
+        app = library_manager.LibraryApp.__new__(library_manager.LibraryApp)
+        app.db = FakeDatabase()
+        watched_file = Path(r"C:\VoiceDream\Family Law Cases Text Problems Fifth Edition.docx")
+
+        with patch.object(library_manager, "read_text_for_metadata_detection", return_value=""):
+            row, reason = app.watched_file_matches_existing_metadata(watched_file)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 11)
+        self.assertIn("richer corrected metadata", reason)
+
+    def test_quickstart_files_are_ignored_for_import(self):
+        app = library_manager.LibraryApp.__new__(library_manager.LibraryApp)
+        with TemporaryDirectory() as temp:
+            folder = Path(temp)
+            quickstart = folder / "QuickStart.pdf"
+            quickstart.write_text("not a book", encoding="utf-8")
+            normal = folder / "Contracts.pdf"
+            normal.write_text("book", encoding="utf-8")
+
+            self.assertTrue(app.is_ignored_import_file(quickstart))
+            self.assertFalse(app.is_ignored_import_file(normal))
+
 
 if __name__ == "__main__":
     main()
