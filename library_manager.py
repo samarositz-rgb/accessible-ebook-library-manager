@@ -6,7 +6,7 @@ Features:
 - Standard Tkinter controls.
 - Windows-style menu bar for screen-reader friendly command access.
 - Plain listbox instead of a table so each book is spoken as one complete labeled row.
-- Add EPUB, PDF, DOCX, TXT, MOBI, AZW, AZW3, HTML, ZIP, and other ebook/document files.
+- Add EPUB, PDF, DOCX, TXT, MOBI, AZW, AZW3, KFX, HTML, ZIP, and other ebook/document files.
 - Stores metadata in a simple SQLite database.
 - For EPUB files, writes title, author, source, tags, and notes into the EPUB file itself.
 - Copies imported books into a managed library folder.
@@ -66,6 +66,7 @@ from tkinter import (
 from tkinter import ttk
 from xml.etree import ElementTree as ET
 
+from calibre_tools import CALIBRE_METADATA_EXTENSIONS, find_calibre_tool, read_calibre_metadata
 from document_text import (
     detect_language_from_text,
     extract_text_for_indexing,
@@ -95,7 +96,7 @@ BOOKS_FOLDER = "Books"
 
 SUPPORTED_EXTENSIONS = {
     ".epub", ".pdf", ".docx", ".doc", ".txt", ".rtf",
-    ".mobi", ".azw", ".azw3", ".html", ".htm", ".zip"
+    ".mobi", ".azw", ".azw3", ".kfx", ".kfx-zip", ".prc", ".html", ".htm", ".zip"
 }
 VOICE_DREAM_LIBRARY_NOTICE = (
     "Please do not delete this file, or any files within these folders. "
@@ -1657,7 +1658,7 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
     if not result["source"]:
         if "bookshare" in combined:
             result["source"] = "Bookshare"
-        elif "kindle" in combined or path.suffix.lower() in {".azw", ".azw3", ".mobi"}:
+        elif "kindle" in combined or path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS:
             result["source"] = "Kindle"
         else:
             result["source"] = "Personal"
@@ -1672,6 +1673,8 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             tags.append("Bookshare")
         if path.suffix.lower() == ".epub":
             tags.append("EPUB")
+        elif path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS:
+            tags.append("Kindle")
         elif path.suffix.lower() == ".docx":
             tags.append("DOCX")
         elif path.suffix.lower() == ".pdf":
@@ -2568,6 +2571,12 @@ class LibraryApp:
         settings_menu.add_command(label="Set Dolphin EasyReader Folder...", command=self.choose_dolphin_easyreader_folder)
         settings_menu.add_command(label="Set NLS eReader Folder...", command=self.choose_nls_ereader_folder)
         settings_menu.add_command(label="Set Kindle Email Addresses...", command=self.set_kindle_email)
+        settings_menu.add_separator()
+        calibre_menu = Menu(settings_menu, tearoff=False)
+        calibre_menu.add_command(label="Show Calibre Tools Status", command=self.show_calibre_tools_status)
+        calibre_menu.add_command(label="Toggle Calibre Metadata Reading", command=self.toggle_calibre_metadata_reading)
+        settings_menu.add_cascade(label="Kindle and Calibre", menu=calibre_menu)
+        settings_menu.add_separator()
         settings_menu.add_command(label="Set Default Ebook Reader...", command=self.choose_default_reader)
         settings_menu.add_command(label="Use System Default Reader", command=self.clear_default_reader)
         settings_menu.add_command(label="Open Library Folder", command=self.open_library_folder)
@@ -4435,6 +4444,7 @@ class LibraryApp:
         supported_inside = [
             path for path in extracted_files
             if path.suffix.lower() in SUPPORTED_EXTENSIONS and path.suffix.lower() != ".zip"
+            and not self.is_ignored_import_file(path)
         ]
 
         epubs = [path for path in supported_inside if path.suffix.lower() == ".epub"]
@@ -4479,6 +4489,10 @@ class LibraryApp:
         if source_path.suffix.lower() == ".epub":
             epub_metadata = read_epub_metadata(source_path)
             metadata.update({key: value for key, value in epub_metadata.items() if value})
+
+        if source_path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS and self.calibre_metadata_reading_enabled():
+            calibre_metadata = read_calibre_metadata(source_path)
+            metadata.update({key: value for key, value in calibre_metadata.items() if value})
 
         return detect_metadata_from_text(source_path, existing=metadata)
 
@@ -5178,7 +5192,7 @@ class LibraryApp:
         paths = filedialog.askopenfilenames(
             title="Choose books to add",
             filetypes=[
-                ("Ebook and document files", "*.epub *.pdf *.docx *.doc *.txt *.rtf *.mobi *.azw *.azw3 *.html *.htm *.zip"),
+                ("Ebook and document files", "*.epub *.pdf *.docx *.doc *.txt *.rtf *.mobi *.azw *.azw3 *.kfx *.kfx-zip *.prc *.html *.htm *.zip"),
                 ("All files", "*.*"),
             ],
         )
@@ -5212,14 +5226,7 @@ class LibraryApp:
                     )
                 continue
 
-            default_title = clean_filename_title(source_path)
-            initial_metadata = {"title": default_title, "author": "", "source": "", "tags": "", "notes": ""}
-
-            if source_path.suffix.lower() == ".epub":
-                epub_metadata = read_epub_metadata(source_path)
-                initial_metadata.update({key: value for key, value in epub_metadata.items() if value})
-
-            initial_metadata = detect_metadata_from_text(source_path, existing=initial_metadata)
+            initial_metadata = self.guess_metadata_from_file(source_path)
 
             metadata = TkMetadataDialog.ask(self.root, "Add Book Metadata", initial_metadata)
             if not metadata:
@@ -6091,25 +6098,41 @@ class LibraryApp:
                 "I could not find Kindle for PC. Install Kindle for PC, then try again."
             )
 
+    def calibre_metadata_reading_enabled(self):
+        db = getattr(self, "db", None)
+        if db is None or not hasattr(db, "get_setting"):
+            return True
+        return db.get_setting("calibre_metadata_reading", "1") != "0"
+
+    def toggle_calibre_metadata_reading(self):
+        enabled = not self.calibre_metadata_reading_enabled()
+        self.db.set_setting("calibre_metadata_reading", "1" if enabled else "0")
+        state = "on" if enabled else "off"
+        self.status_var.set(f"Calibre metadata reading is now {state}.")
+        messagebox.showinfo(
+            "Calibre Metadata Reading",
+            f"Calibre metadata reading is now {state}.\n\n"
+            "When this is on, the manager uses Calibre's command-line metadata tool quietly for Kindle files. "
+            "You still use this app as the interface."
+        )
+
+    def show_calibre_tools_status(self):
+        ebook_meta = find_calibre_tool("ebook-meta")
+        ebook_convert = find_calibre_tool("ebook-convert")
+        metadata_state = "On" if self.calibre_metadata_reading_enabled() else "Off"
+        lines = [
+            f"Calibre metadata reading: {metadata_state}",
+            "",
+            f"Metadata tool: {ebook_meta or 'Not found'}",
+            f"Conversion tool: {ebook_convert or 'Not found'}",
+            "",
+            "Calibre is used only as a background helper. The manager does not open Calibre's interface and does not remove DRM.",
+        ]
+        messagebox.showinfo("Kindle and Calibre", "\n".join(lines))
+        self.status_var.set("Calibre tools status shown.")
+
     def find_ebook_convert(self):
-        found = shutil.which("ebook-convert")
-        if found:
-            return found
-
-        possible_paths = []
-        if sys.platform.startswith("win"):
-            possible_paths.extend([
-                Path(os.environ.get("PROGRAMFILES", "")) / "Calibre2" / "ebook-convert.exe",
-                Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Calibre2" / "ebook-convert.exe",
-                Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Calibre2" / "ebook-convert.exe",
-            ])
-        elif sys.platform == "darwin":
-            possible_paths.append(Path("/Applications/calibre.app/Contents/MacOS/ebook-convert"))
-
-        for candidate in possible_paths:
-            if candidate.exists():
-                return str(candidate)
-        return None
+        return find_calibre_tool("ebook-convert")
 
     def convert_selected_to_epub(self):
         book_id = self.selected_book_id()
@@ -7042,9 +7065,8 @@ catch {
         self.refresh_books()
         self.status_var.set(f"Removed {removed} book{'s' if removed != 1 else ''} from library.")
 
-    def show_help(self):
-        messagebox.showinfo(
-            "Help",
+    def help_text(self):
+        return (
             "Accessible Ebook Library Manager keyboard commands:\n\n"
             "Alt: Open the menu bar.\n"
             "Control+N: Add book.\n"
@@ -7084,6 +7106,7 @@ catch {
             "Use Settings, Watched Folders, to add folders that are scanned automatically for new or changed ebook files.\n"
             "Use Settings, File Explorer Integration, to add or remove a Windows right-click command for adding supported files directly from File Explorer.\n"
             "If NVDA is running and its controller is available, the app automatically uses NVDA book list announcements. No setting is needed.\n"
+            "Use Settings, Kindle and Calibre, to check whether Calibre's background command-line tools are available. The manager can use those tools for Kindle metadata without opening Calibre's interface.\n"
             "Use Settings, Set Kindle Email Addresses, to save more than one Send to Kindle address.\n"
             "Use File, Send To, NLS eReader, to copy the selected book to a connected NLS eReader. If the app cannot detect it, you can choose the eReader folder manually.\n"
             "Use File, Send To, HumanWare Braille eReader MTP, when Windows shows the device under This PC but File Explorer does not give it a pasteable folder path.\n"
@@ -7095,6 +7118,28 @@ catch {
             "EPUB metadata changes are written into the EPUB file itself, with a .bak backup made first. "
             "Other file formats are updated in the library database only. This app does not remove DRM."
         )
+
+    def help_file_path(self):
+        return app_data_folder() / "Accessible Ebook Library Manager Help.txt"
+
+    def show_help(self):
+        help_path = self.help_file_path()
+        try:
+            help_path.parent.mkdir(parents=True, exist_ok=True)
+            help_path.write_text(self.help_text(), encoding="utf-8")
+            if sys.platform.startswith("win"):
+                os.startfile(help_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(help_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(help_path)])
+            self.status_var.set(f"Help opened at {help_path}.")
+        except Exception as exc:
+            messagebox.showerror(
+                "Help could not be opened",
+                f"I could not open the help file in the default text editor.\n\n"
+                f"Help file path:\n{help_path}\n\n{exc}"
+            )
 
 
 def _setup_logging():

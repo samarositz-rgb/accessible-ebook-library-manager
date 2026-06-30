@@ -7,10 +7,15 @@ from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = PROJECT_ROOT / "library_manager.py"
+CALIBRE_TOOLS_PATH = PROJECT_ROOT / "calibre_tools.py"
 
 spec = importlib.util.spec_from_file_location("library_manager", MODULE_PATH)
 library_manager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(library_manager)
+
+calibre_spec = importlib.util.spec_from_file_location("calibre_tools", CALIBRE_TOOLS_PATH)
+calibre_tools = importlib.util.module_from_spec(calibre_spec)
+calibre_spec.loader.exec_module(calibre_tools)
 
 
 def detect_for_pdf(filename, text):
@@ -236,6 +241,52 @@ class MetadataDetectionTests(TestCase):
 
             self.assertTrue(app.is_ignored_import_file(quickstart))
             self.assertFalse(app.is_ignored_import_file(normal))
+
+    def test_calibre_opf_metadata_prefers_isbn13(self):
+        opf = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata>
+    <dc:title>Kindle Sample Book</dc:title>
+    <dc:creator>Jane Author</dc:creator>
+    <dc:publisher>Sample Press</dc:publisher>
+    <dc:date>2020-04-15</dc:date>
+    <dc:subject>Law</dc:subject>
+    <dc:subject>Study</dc:subject>
+    <dc:identifier opf:scheme="ISBN" xmlns:opf="http://www.idpf.org/2007/opf">0-123-45678-9</dc:identifier>
+    <dc:identifier opf:scheme="ISBN" xmlns:opf="http://www.idpf.org/2007/opf">978-0-123-45678-6</dc:identifier>
+  </metadata>
+</package>"""
+
+        metadata = calibre_tools.parse_calibre_opf_metadata(opf)
+
+        self.assertEqual(metadata["title"], "Kindle Sample Book")
+        self.assertEqual(metadata["author"], "Jane Author")
+        self.assertEqual(metadata["publisher"], "Sample Press")
+        self.assertEqual(metadata["year"], "2020")
+        self.assertEqual(metadata["isbn"], "9780123456786")
+        self.assertEqual(metadata["tags"], "Law, Study")
+
+    def test_kindle_metadata_uses_calibre_without_opening_calibre_interface(self):
+        app = library_manager.LibraryApp.__new__(library_manager.LibraryApp)
+        source_path = Path("Kindle Sample Book.azw3")
+
+        with (
+            patch.object(library_manager, "read_calibre_metadata", return_value={
+                "title": "Kindle Sample Book",
+                "author": "Jane Author",
+                "publisher": "Sample Press",
+                "year": "2020",
+            }),
+            patch.object(library_manager, "read_text_for_metadata_detection", return_value=""),
+        ):
+            metadata = app.guess_metadata_from_file(source_path)
+
+        self.assertEqual(metadata["title"], "Kindle Sample Book")
+        self.assertEqual(metadata["author"], "Jane Author")
+        self.assertEqual(metadata["publisher"], "Sample Press")
+        self.assertEqual(metadata["year"], "2020")
+        self.assertEqual(metadata["source"], "Kindle")
+        self.assertIn("Kindle", metadata["tags"])
 
 
 if __name__ == "__main__":
