@@ -65,6 +65,10 @@ from tkinter import (
 )
 from tkinter import ttk
 from xml.etree import ElementTree as ET
+try:
+    from defusedxml.ElementTree import fromstring as _safe_fromstring
+except ImportError:
+    from xml.etree.ElementTree import fromstring as _safe_fromstring
 
 from calibre_tools import CALIBRE_METADATA_EXTENSIONS, find_calibre_tool, read_calibre_metadata
 from document_text import (
@@ -600,7 +604,7 @@ def normalize_book_list_speech_fields(raw_value: str) -> list[str]:
 def get_epub_opf_path(epub_path: Path) -> str:
     with zipfile.ZipFile(epub_path, "r") as archive:
         container_xml = archive.read("META-INF/container.xml")
-    root = ET.fromstring(container_xml)
+    root = _safe_fromstring(container_xml)
     rootfile = root.find(".//container:rootfile", {"container": CONTAINER_NS})
     if rootfile is None:
         raise ValueError("EPUB container file does not point to an OPF package file.")
@@ -616,7 +620,7 @@ def read_epub_metadata(epub_path: Path) -> dict:
         with zipfile.ZipFile(epub_path, "r") as archive:
             opf_xml = archive.read(opf_path)
 
-        root = ET.fromstring(opf_xml)
+        root = _safe_fromstring(opf_xml)
         ns = {"opf": OPF_NS, "dc": DC_NS}
         subjects = []
         for subject in root.findall(".//dc:subject", ns):
@@ -661,7 +665,7 @@ def read_epub_accessibility_metadata(epub_path: Path) -> dict:
         with zipfile.ZipFile(epub_path, "r") as archive:
             opf_xml = archive.read(opf_path)
             names = set(archive.namelist())
-            root = ET.fromstring(opf_xml)
+            root = _safe_fromstring(opf_xml)
             ns = {"opf": OPF_NS}
 
             declared_features = metadata_values_by_property(root, "schema:accessibilityFeature")
@@ -789,7 +793,7 @@ def write_epub_metadata(epub_path: Path, title: str, author: str, source: str, t
 
     with zipfile.ZipFile(epub_path, "r") as source_archive:
         opf_xml = source_archive.read(opf_path)
-        root = ET.fromstring(opf_xml)
+        root = _safe_fromstring(opf_xml)
         ns = {"opf": OPF_NS, "dc": DC_NS}
 
         metadata = root.find("opf:metadata", ns)
@@ -5586,7 +5590,7 @@ class LibraryApp:
 
         with zipfile.ZipFile(epub_path, "r") as source_archive:
             opf_xml = source_archive.read(opf_path)
-            root = ET.fromstring(opf_xml)
+            root = _safe_fromstring(opf_xml)
             ns = {"opf": OPF_NS}
             manifest = root.find("opf:manifest", ns)
             if manifest is None:
@@ -5810,7 +5814,7 @@ class LibraryApp:
 
             opf_path = get_epub_opf_path(epub_path)
             opf_xml = source_archive.read(opf_path)
-            root = ET.fromstring(opf_xml)
+            root = _safe_fromstring(opf_xml)
             metadata = root.find(f"{{{OPF_NS}}}metadata")
             if metadata is None:
                 metadata = ET.SubElement(root, f"{{{OPF_NS}}}metadata")

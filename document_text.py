@@ -7,6 +7,10 @@ import tempfile
 import zipfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+try:
+    from defusedxml.ElementTree import fromstring as _safe_fromstring
+except ImportError:
+    from xml.etree.ElementTree import fromstring as _safe_fromstring
 
 
 WINDOWS_NO_CONSOLE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -88,7 +92,7 @@ def read_text_from_docx(docx_path: Path, max_chars: int = 50000) -> str:
     try:
         with zipfile.ZipFile(docx_path, "r") as archive:
             raw = archive.read("word/document.xml")
-        root = ET.fromstring(raw)
+        root = _safe_fromstring(raw)
         ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         paragraphs = []
         for paragraph in root.findall(".//w:p", ns):
