@@ -115,6 +115,7 @@ from distribute import (
     send_book_to_destination,
     get_ebook_convert_path,
 )
+from drm import detect_drm
 
 APP_NAME = "Accessible Ebook Library Manager"
 
@@ -2479,6 +2480,7 @@ class LibraryApp:
             if not path.exists():
                 return
             self.announce_progress(f"Indexing {path.name}")
+            self._flag_drm_state(book_id, path)
             text = extract_text_for_indexing(path)
             self.db.index_book_content(book_id, text)
             if path.suffix.lower() == ".pdf":
@@ -2487,6 +2489,27 @@ class LibraryApp:
                 self._capture_source_book_id(book_id, path)
         except Exception:
             logger.exception("Failed to index book id=%s path=%s", book_id, stored_path)
+
+    def _flag_drm_state(self, book_id: int, path: Path) -> None:
+        """Tag the book with a DRM content flag if the file is encrypted.
+
+        The tag is one of drm_adobe_adept, drm_epub_encrypted, drm_kobo,
+        or drm_pdf_encrypted (all matching the LIKE %drm% filter). This
+        only reports; it never attempts to decrypt.
+        """
+        try:
+            drm_kind = detect_drm(path)
+        except Exception:
+            logger.exception("DRM detection failed for book id=%s", book_id)
+            return
+        existing = self.db.get_content_flags(book_id)
+        # Remove any prior drm_* flag so re-detection after a decrypted
+        # replacement removes the stale marker.
+        cleaned = [flag for flag in existing if not flag.startswith("drm_")]
+        if drm_kind:
+            cleaned.append(f"drm_{drm_kind}")
+        if cleaned != existing:
+            self.db.set_content_flags(book_id, ",".join(cleaned))
 
     def _capture_source_book_id(self, book_id: int, epub_path: Path) -> None:
         """Extract and store a Bookshare / Learning Ally / ISBN identifier from an EPUB.
