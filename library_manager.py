@@ -106,6 +106,13 @@ from db import (
     parse_utc_text,
     cloud_backup_subfolder,
 )
+from distribute import (
+    Destination,
+    load_destinations,
+    save_destinations,
+    send_book_to_destination,
+    get_ebook_convert_path,
+)
 
 APP_NAME = "Accessible Ebook Library Manager"
 
@@ -1340,12 +1347,18 @@ class LibraryApp:
         file_menu.add_command(label="Add Book...\tCtrl+N", command=self.add_book)
         file_menu.add_command(label="Import Folder...\tCtrl+Shift+N", command=self.import_folder)
         file_menu.add_command(label="Export Book Copy...\tCtrl+E", command=self.export_book)
-        send_to_menu = Menu(file_menu, tearoff=False)
+        send_to_menu = Menu(file_menu, tearoff=False, postcommand=self._refresh_send_to_menu)
+        self._send_to_menu = send_to_menu
+        self._send_to_builtin_end_index = None  # set on first refresh
         send_to_menu.add_command(label="Voice Dream...\tCtrl+Shift+V", command=self.send_to_voice_dream)
         send_to_menu.add_command(label="Dolphin EasyReader...", command=self.send_to_dolphin_easyreader)
         send_to_menu.add_command(label="Kindle...\tCtrl+Shift+K", command=self.send_to_kindle)
         send_to_menu.add_command(label="NLS eReader...\tCtrl+Shift+E", command=self.send_to_nls_ereader)
         send_to_menu.add_command(label="HumanWare Braille eReader (MTP)...", command=self.send_to_humanware_mtp)
+        send_to_menu.add_separator()
+        send_to_menu.add_command(label="Manage Custom Destinations...", command=self.manage_custom_destinations)
+        # Record where custom destinations should be inserted (before the last two entries).
+        self._send_to_builtin_end_index = send_to_menu.index("end") - 1
         file_menu.add_cascade(label="Send To", menu=send_to_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Exit\tAlt+F4", command=self.root.quit)
@@ -5910,6 +5923,224 @@ catch {
             messagebox.showinfo(
                 f"Sent to {app_name}",
                 f"Copied {sent} book{'s' if sent != 1 else ''} to the {folder_name}."
+            )
+
+    # ------------------------------------------------------------------
+    # Custom user-defined destinations
+    # ------------------------------------------------------------------
+
+    def _refresh_send_to_menu(self):
+        """Rebuild the custom-destinations portion of the Send To menu."""
+        menu = getattr(self, "_send_to_menu", None)
+        if menu is None or self._send_to_builtin_end_index is None:
+            return
+        # Remove any previously-added custom-destination entries.
+        while menu.index("end") is not None and menu.index("end") > self._send_to_builtin_end_index + 1:
+            menu.delete(self._send_to_builtin_end_index + 2)
+        destinations = load_destinations(self.db)
+        if not destinations:
+            return
+        menu.add_separator()
+        for destination in destinations:
+            label = destination.name
+            if destination.target_format:
+                label = f"{destination.name} (as .{destination.normalized_format()})"
+            menu.add_command(
+                label=label,
+                command=lambda d=destination: self.send_to_custom_destination(d),
+            )
+
+    def manage_custom_destinations(self):
+        destinations = load_destinations(self.db)
+        window = tk.Toplevel(self.root)
+        window.title("Custom Destinations")
+        window.geometry("560x360")
+        window.transient(self.root)
+        window.grab_set()
+
+        ttk.Label(
+            window,
+            text="Custom destinations appear at the bottom of the Send To menu.",
+            wraplength=520,
+            padding=(12, 8),
+        ).pack(fill=X)
+
+        listbox = Listbox(window, height=10, activestyle="dotbox", takefocus=1)
+        listbox.pack(fill=BOTH, expand=True, padx=12, pady=(0, 8))
+
+        def repaint():
+            listbox.delete(0, END)
+            for d in destinations:
+                fmt = f" as .{d.normalized_format()}" if d.target_format else ""
+                listbox.insert(END, f"{d.name}{fmt}  ->  {d.path}")
+            if destinations:
+                listbox.selection_clear(0, END)
+                listbox.selection_set(0)
+                listbox.activate(0)
+
+        def selected_index():
+            selection = listbox.curselection()
+            return selection[0] if selection else None
+
+        def prompt_destination(existing: Destination | None) -> Destination | None:
+            heading = "Edit Destination" if existing else "Add Destination"
+            name = AccessibleSingleFieldDialog.ask(
+                window, heading,
+                "Enter a short name for this destination, such as Voice Dream on iCloud.",
+                existing.name if existing else "",
+            )
+            if not name:
+                return None
+            path = AccessibleSingleFieldDialog.ask(
+                window, heading,
+                "Enter the full folder path this destination copies books to.",
+                existing.path if existing else "",
+            )
+            if not path:
+                return None
+            fmt = AccessibleSingleFieldDialog.ask(
+                window, heading,
+                "Optional target format such as epub, pdf, or mobi. Leave blank to copy as-is. "
+                "Conversion requires Calibre.",
+                existing.target_format if existing else "",
+            )
+            if fmt is None:
+                return None
+            notice = AccessibleSingleFieldDialog.ask(
+                window, heading,
+                "Optional notice to place in the folder as IMPORTANT NOTICE.txt (for cloud-synced readers). "
+                "Leave blank for none.",
+                existing.post_copy_notice if existing else "",
+            )
+            if notice is None:
+                return None
+            return Destination(
+                name=name.strip(),
+                path=path.strip(),
+                target_format=fmt.strip(),
+                post_copy_notice=notice.strip(),
+            )
+
+        def on_add():
+            new_destination = prompt_destination(None)
+            if new_destination is None:
+                return
+            destinations.append(new_destination)
+            save_destinations(self.db, destinations)
+            repaint()
+
+        def on_edit():
+            index = selected_index()
+            if index is None:
+                return
+            edited = prompt_destination(destinations[index])
+            if edited is None:
+                return
+            destinations[index] = edited
+            save_destinations(self.db, destinations)
+            repaint()
+
+        def on_remove():
+            index = selected_index()
+            if index is None:
+                return
+            removed_name = destinations[index].name
+            if not messagebox.askyesno("Remove destination", f"Remove destination '{removed_name}'?", parent=window):
+                return
+            del destinations[index]
+            save_destinations(self.db, destinations)
+            repaint()
+
+        def on_close():
+            window.grab_release()
+            window.destroy()
+
+        buttons = ttk.Frame(window, padding=(12, 0, 12, 12))
+        buttons.pack(fill=X)
+        ttk.Button(buttons, text="Add...", command=on_add).pack(side=LEFT)
+        ttk.Button(buttons, text="Edit...", command=on_edit).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Remove", command=on_remove).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Close", command=on_close).pack(side=RIGHT)
+
+        window.bind("<Escape>", lambda event: on_close())
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        repaint()
+        listbox.focus_set()
+
+    def send_to_custom_destination(self, destination: Destination):
+        book_ids = self.selected_book_ids()
+        if not book_ids:
+            return
+        rows = [self.db.get_book(book_id) for book_id in book_ids]
+        rows = [row for row in rows if row]
+        if not rows:
+            messagebox.showerror("Book not found", "The selected book or books were not found.")
+            return
+
+        dest_folder = Path(destination.path)
+        if not dest_folder.exists() or not dest_folder.is_dir():
+            messagebox.showerror(
+                "Destination folder missing",
+                f"The folder for '{destination.name}' does not exist:\n\n{destination.path}\n\n"
+                "Open Send To, Manage Custom Destinations to update it."
+            )
+            return
+
+        ebook_convert = get_ebook_convert_path() if destination.target_format else None
+        if destination.target_format and not ebook_convert:
+            messagebox.showerror(
+                "Calibre not found",
+                f"Destination '{destination.name}' converts books to .{destination.normalized_format()} "
+                "before copying, but Calibre's ebook-convert was not found. Install Calibre or clear the "
+                "destination's target format."
+            )
+            return
+
+        sent = 0
+        skipped: list[str] = []
+        for row in rows:
+            source = Path(row[8])
+            title = row[1]
+            if not source.exists():
+                skipped.append(f"{title}: stored file missing")
+                continue
+            try:
+                send_book_to_destination(
+                    source, destination,
+                    ebook_convert_path=ebook_convert,
+                    overwrite=False,
+                )
+                sent += 1
+            except FileExistsError as exc:
+                if messagebox.askyesno(
+                    "Replace existing file",
+                    f"{Path(str(exc)).name} already exists in '{destination.name}'. Replace it?"
+                ):
+                    try:
+                        send_book_to_destination(
+                            source, destination,
+                            ebook_convert_path=ebook_convert,
+                            overwrite=True,
+                        )
+                        sent += 1
+                    except Exception as retry_exc:
+                        skipped.append(f"{title}: {retry_exc}")
+                else:
+                    skipped.append(f"{title}: skipped because the file already exists")
+            except Exception as exc:
+                skipped.append(f"{title}: {exc}")
+
+        self.status_var.set(f"Sent {sent} book{'s' if sent != 1 else ''} to {destination.name}.")
+        if skipped:
+            messagebox.showwarning(
+                f"Send to {destination.name} finished with warnings",
+                f"Copied {sent} book{'s' if sent != 1 else ''} to '{destination.name}'.\n\n"
+                + "\n".join(skipped[:20])
+            )
+        else:
+            messagebox.showinfo(
+                f"Sent to {destination.name}",
+                f"Copied {sent} book{'s' if sent != 1 else ''} to '{destination.name}'."
             )
 
     def export_book(self):
