@@ -1,4 +1,5 @@
 import html
+import logging
 import re
 import shutil
 import subprocess
@@ -15,6 +16,17 @@ except ImportError:
 
 WINDOWS_NO_CONSOLE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+logger = logging.getLogger(__name__)
+
+# Set to True the first time we fall back to raw-bytes PDF metadata scraping
+# because pypdf is not installed. The UI reads this to warn the user once.
+pdf_extraction_degraded = False
+
+
+def is_pdf_extraction_degraded() -> bool:
+    """Return True if any PDF has been read without pypdf during this session."""
+    return pdf_extraction_degraded
+
 
 def strip_xml_html_tags(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
@@ -30,7 +42,11 @@ def strip_xml_html_tags_preserve_lines(text: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
+EPUB_CONTENT_FILE_LIMIT = 80
+
+
+def _read_text_from_epub(epub_path: Path, max_chars: int, preserve_lines: bool) -> str:
+    strip = strip_xml_html_tags_preserve_lines if preserve_lines else strip_xml_html_tags
     chunks = []
     try:
         with zipfile.ZipFile(epub_path, "r") as archive:
@@ -43,10 +59,10 @@ def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
                 and "container.xml" not in name.lower()
             ]
 
-            for name in text_names[:80]:
+            for name in text_names[:EPUB_CONTENT_FILE_LIMIT]:
                 try:
                     decoded = archive.read(name).decode("utf-8", errors="ignore")
-                    cleaned = strip_xml_html_tags(decoded)
+                    cleaned = strip(decoded)
                     if cleaned:
                         chunks.append(cleaned)
                     if sum(len(chunk) for chunk in chunks) >= max_chars:
@@ -57,35 +73,14 @@ def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
         return ""
 
     return "\n".join(chunks)[:max_chars]
+
+
+def read_text_from_epub(epub_path: Path, max_chars: int = 50000) -> str:
+    return _read_text_from_epub(epub_path, max_chars, preserve_lines=False)
 
 
 def read_text_from_epub_preserve_lines(epub_path: Path, max_chars: int = 50000) -> str:
-    chunks = []
-    try:
-        with zipfile.ZipFile(epub_path, "r") as archive:
-            names = archive.namelist()
-            text_names = [
-                name for name in names
-                if name.lower().endswith((".xhtml", ".html", ".htm", ".xml"))
-                and "nav" not in name.lower()
-                and "toc" not in name.lower()
-                and "container.xml" not in name.lower()
-            ]
-
-            for name in text_names[:80]:
-                try:
-                    decoded = archive.read(name).decode("utf-8", errors="ignore")
-                    cleaned = strip_xml_html_tags_preserve_lines(decoded)
-                    if cleaned:
-                        chunks.append(cleaned)
-                    if sum(len(chunk) for chunk in chunks) >= max_chars:
-                        break
-                except Exception:
-                    continue
-    except Exception:
-        return ""
-
-    return "\n".join(chunks)[:max_chars]
+    return _read_text_from_epub(epub_path, max_chars, preserve_lines=True)
 
 
 def read_text_from_docx(docx_path: Path, max_chars: int = 50000) -> str:
@@ -210,6 +205,13 @@ def read_text_from_pdf(pdf_path: Path, max_chars: int = 50000) -> str:
     try:
         from pypdf import PdfReader
     except Exception:
+        global pdf_extraction_degraded
+        if not pdf_extraction_degraded:
+            logger.warning(
+                "pypdf is not installed; falling back to raw-bytes PDF metadata scraping. "
+                "Install pypdf for full PDF text extraction."
+            )
+        pdf_extraction_degraded = True
         return read_metadata_text_from_pdf(pdf_path, max_chars=max_chars)
 
     chunks = []
@@ -276,8 +278,12 @@ def extract_text_for_indexing(path: Path) -> str:
 
 
 def detect_language_from_text(text: str, default: str = "en") -> str:
-    sample = re.sub(r"[^A-Za-zÃ€-Ã–Ã˜-Ã¶Ã¸-Ã¿' ]+", " ", text or "").casefold()
-    words = re.findall(r"[a-zÃ€-Ã–Ã˜-Ã¶Ã¸-Ã¿']+", sample[:200000])
+    # Latin letters plus the Latin-1 Supplement letter block
+    # (À-Ö = À-Ö, Ø-ö = Ø-ö, ø-ÿ = ø-ÿ).
+    # The apostrophe survives so contractions like "l'homme" tokenize correctly.
+    letter_class = r"A-Za-zÀ-ÖØ-öø-ÿ"
+    sample = re.sub(rf"[^{letter_class}' ]+", " ", text or "").casefold()
+    words = re.findall(rf"[{letter_class}']+", sample[:200000])
     if not words:
         return default
 
@@ -286,9 +292,9 @@ def detect_language_from_text(text: str, default: str = "en") -> str:
         "en": {"the", "and", "of", "to", "in", "that", "is", "for", "with", "as", "was", "are", "by", "from", "this"},
         "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del"},
         "fr": {"le", "la", "les", "de", "des", "que", "et", "en", "un", "une", "pour", "avec", "est", "dans", "du"},
-        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "fÃ¼r"},
-        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "Ã¨", "del", "della"},
-        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "Ã©", "do", "da"},
+        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "für"},
+        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "è", "del", "della"},
+        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "é", "do", "da"},
     }
     scores = {}
     for language, markers in language_markers.items():

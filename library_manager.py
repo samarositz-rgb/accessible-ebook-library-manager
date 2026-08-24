@@ -74,6 +74,7 @@ from calibre_tools import CALIBRE_METADATA_EXTENSIONS, find_calibre_tool, read_c
 from document_text import (
     detect_language_from_text,
     extract_text_for_indexing,
+    is_pdf_extraction_degraded,
     read_text_from_epub_preserve_lines,
     read_text_for_metadata_detection,
     strip_xml_html_tags,
@@ -1338,6 +1339,7 @@ class LibraryApp:
         self.schedule_backup_check(5000)
         self.schedule_watched_folder_scan(15000)
         self.root.after(750, self.import_command_line_files)
+        self.root.after(10000, self._check_pdf_extraction_health)
 
     def build_menu(self):
         menu_bar = Menu(self.root)
@@ -2278,7 +2280,26 @@ class LibraryApp:
             text = extract_text_for_indexing(path)
             self.db.index_book_content(book_id, text)
         except Exception:
-            pass
+            logger.exception("Failed to index book id=%s path=%s", book_id, stored_path)
+
+    def _check_pdf_extraction_health(self):
+        """If we fell back to raw-bytes PDF scraping, warn the user once."""
+        try:
+            if not is_pdf_extraction_degraded():
+                self.root.after(30000, self._check_pdf_extraction_health)
+                return
+            if self.db.get_setting("pdf_pypdf_warning_shown", ""):
+                return
+            self.db.set_setting("pdf_pypdf_warning_shown", "1")
+            messagebox.showwarning(
+                "PDF text extraction is limited",
+                "This session read at least one PDF without the pypdf library, so PDF text and "
+                "content search will be very limited. Install pypdf for full PDF support:\n\n"
+                "    pip install pypdf\n\n"
+                "Then close and reopen this app. You will only see this notice once."
+            )
+        except Exception:
+            logger.exception("PDF extraction health check failed")
 
     def queue_book_for_indexing(self, book_id: int, stored_path: str):
         self._index_queue.put((book_id, stored_path))
