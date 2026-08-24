@@ -14,7 +14,7 @@ from pathlib import Path
 
 DB_NAME = "library.db"
 BOOKS_FOLDER = "Books"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ACCESSIBILITY_METADATA_KEYS = [
     "accessibility_summary",
@@ -177,6 +177,9 @@ class LibraryDatabase:
             "content_indexed_at": "TEXT DEFAULT NULL",
             "content_flags": "TEXT DEFAULT ''",
             "source_book_id": "TEXT DEFAULT ''",
+            "reading_status": "TEXT DEFAULT ''",
+            "opened_at": "TEXT DEFAULT NULL",
+            "finished_at": "TEXT DEFAULT NULL",
         }
         for name, column_type in columns.items():
             if name not in existing:
@@ -292,6 +295,45 @@ class LibraryDatabase:
         if not row or not row[0]:
             return []
         return [flag.strip() for flag in row[0].split(",") if flag.strip()]
+
+    def set_reading_status(self, book_id: int, status: str) -> None:
+        """Store the reading status ('want', 'reading', 'finished', 'archived', or '')."""
+        stamp = utc_now_text() if status == "finished" else None
+        if status == "finished":
+            self.connection.execute(
+                "UPDATE books SET reading_status = ?, finished_at = ? WHERE id = ?",
+                (status, stamp, book_id),
+            )
+        else:
+            self.connection.execute(
+                "UPDATE books SET reading_status = ? WHERE id = ?",
+                (status, book_id),
+            )
+        self.connection.commit()
+
+    def stamp_book_opened(self, book_id: int) -> None:
+        """Set opened_at to now. Bumps status to 'reading' unless already 'finished' or 'archived'."""
+        current = self.connection.execute(
+            "SELECT reading_status FROM books WHERE id = ?", (book_id,)
+        ).fetchone()
+        existing_status = (current[0] if current else "") or ""
+        if existing_status in ("finished", "archived"):
+            self.connection.execute(
+                "UPDATE books SET opened_at = ? WHERE id = ?",
+                (utc_now_text(), book_id),
+            )
+        else:
+            self.connection.execute(
+                "UPDATE books SET reading_status = 'reading', opened_at = ? WHERE id = ?",
+                (utc_now_text(), book_id),
+            )
+        self.connection.commit()
+
+    def get_reading_status(self, book_id: int) -> str:
+        row = self.connection.execute(
+            "SELECT reading_status FROM books WHERE id = ?", (book_id,)
+        ).fetchone()
+        return (row[0] if row else "") or ""
 
     def set_source_book_id(self, book_id: int, source_book_id: str) -> None:
         self.connection.execute(
@@ -414,6 +456,7 @@ class LibraryDatabase:
         accessibility_feature_filter="",
         accessibility_hazard_filter="",
         content_flag_filter="",
+        reading_status_filter="",
         extra_ids=None,
     ):
         query = query.strip()
@@ -423,6 +466,7 @@ class LibraryDatabase:
         accessibility_feature_filter = accessibility_feature_filter.strip()
         accessibility_hazard_filter = accessibility_hazard_filter.strip()
         content_flag_filter = content_flag_filter.strip()
+        reading_status_filter = reading_status_filter.strip().lower()
 
         order_map = {
             "title": "title COLLATE NOCASE ASC, author COLLATE NOCASE ASC",
@@ -491,6 +535,10 @@ class LibraryDatabase:
         if content_flag_filter:
             conditions.append("content_flags LIKE ?")
             params.append(f"%{content_flag_filter}%")
+
+        if reading_status_filter:
+            conditions.append("LOWER(COALESCE(reading_status, '')) = ?")
+            params.append(reading_status_filter)
 
         where_clause = ""
         if conditions:

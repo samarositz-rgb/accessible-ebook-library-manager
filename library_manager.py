@@ -1366,12 +1366,15 @@ class LibraryApp:
         self.filter_accessibility_feature = ""
         self.filter_accessibility_hazard = ""
         self.filter_content_flag = ""
+        self.filter_reading_status = ""
         self.backup_check_after = None
         self.watched_scan_after = None
         self.watched_scan_running = False
         self._index_queue = queue.Queue()
         self._shutdown_event = threading.Event()
         self._index_thread = None
+        self._last_progress_announcement_at = 0.0
+        self._progress_announcement_min_gap = 3.0
         self._start_content_indexer()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1425,6 +1428,13 @@ class LibraryApp:
         book_menu.add_command(label="Focus Books List\tCtrl+L", command=self.focus_books_list)
         book_menu.add_command(label="Select All Books\tCtrl+A", command=self.select_all_books)
         book_menu.add_command(label="Deselect All Books\tCtrl+Shift+A", command=self.deselect_all_books)
+        shelf_status_menu = Menu(book_menu, tearoff=False)
+        shelf_status_menu.add_command(label="Want to Read", command=lambda: self.set_selected_reading_status("want"))
+        shelf_status_menu.add_command(label="Reading Now", command=lambda: self.set_selected_reading_status("reading"))
+        shelf_status_menu.add_command(label="Finished", command=lambda: self.set_selected_reading_status("finished"))
+        shelf_status_menu.add_command(label="Archived", command=lambda: self.set_selected_reading_status("archived"))
+        shelf_status_menu.add_command(label="Clear Status", command=lambda: self.set_selected_reading_status(""))
+        book_menu.add_cascade(label="Set Reading Status", menu=shelf_status_menu)
         book_menu.add_command(label="Delete from Library\tDelete", command=self.delete_book)
         menu_bar.add_cascade(label="Book", menu=book_menu, underline=0)
 
@@ -1451,6 +1461,14 @@ class LibraryApp:
         filter_menu.add_command(label="By Accessibility Feature...", command=self.set_accessibility_feature_filter)
         filter_menu.add_command(label="By Accessibility Hazard...", command=self.set_accessibility_hazard_filter)
         filter_menu.add_command(label="By Content Flag...", command=self.set_content_flag_filter)
+        filter_menu.add_separator()
+        shelf_filter_menu = Menu(filter_menu, tearoff=False)
+        shelf_filter_menu.add_command(label="All Shelves", command=lambda: self.set_shelf_filter(""))
+        shelf_filter_menu.add_command(label="Want to Read", command=lambda: self.set_shelf_filter("want"))
+        shelf_filter_menu.add_command(label="Reading Now", command=lambda: self.set_shelf_filter("reading"))
+        shelf_filter_menu.add_command(label="Finished", command=lambda: self.set_shelf_filter("finished"))
+        shelf_filter_menu.add_command(label="Archived", command=lambda: self.set_shelf_filter("archived"))
+        filter_menu.add_cascade(label="By Shelf", menu=shelf_filter_menu)
         filter_menu.add_separator()
         filter_menu.add_command(label="Clear Filters", command=self.clear_filters)
         organize_menu.add_cascade(label="Filter", menu=filter_menu)
@@ -1501,6 +1519,7 @@ class LibraryApp:
         backup_menu.add_cascade(label="Backup Schedule", menu=schedule_menu)
         backup_menu.add_separator()
         backup_menu.add_command(label="Back Up Now", command=self.backup_library_now)
+        backup_menu.add_command(label="Verify Last Backup", command=self.verify_last_backup)
         backup_menu.add_command(label="Restore From Backup...", command=self.restore_library_backup)
         backup_menu.add_command(label="Show Backup Status", command=self.show_backup_status)
         settings_menu.add_cascade(label="Library Backup", menu=backup_menu)
@@ -1663,6 +1682,8 @@ class LibraryApp:
             parts.append(f"accessibility hazard contains {self.filter_accessibility_hazard}")
         if self.filter_content_flag:
             parts.append(f"content flag contains {self.filter_content_flag}")
+        if self.filter_reading_status:
+            parts.append(f"shelf is {self.filter_reading_status}")
         if not parts:
             return "No filters"
         return "; ".join(parts)
@@ -1722,9 +1743,38 @@ class LibraryApp:
         self.filter_accessibility_feature = ""
         self.filter_accessibility_hazard = ""
         self.filter_content_flag = ""
+        self.filter_reading_status = ""
         self.refresh_books()
         self.focus_books_list()
         self.status_var.set("Filters cleared.")
+
+    def set_shelf_filter(self, status: str):
+        """Filter by reading-status shelf: '' clears, otherwise 'want' / 'reading' / 'finished' / 'archived'."""
+        self.filter_reading_status = status or ""
+        self.refresh_books()
+        self.focus_books_list()
+        label = status.title() if status else "All shelves"
+        self.status_var.set(
+            f"Shelf filter: {label}. {self.book_list.size()} "
+            f"book{'s' if self.book_list.size() != 1 else ''} shown."
+        )
+
+    def set_selected_reading_status(self, status: str):
+        """Set the reading status on every selected book."""
+        book_ids = self.selected_book_ids()
+        if not book_ids:
+            return
+        for book_id in book_ids:
+            try:
+                self.db.set_reading_status(book_id, status)
+            except Exception:
+                logger.exception("Failed to set reading status for book id=%s", book_id)
+        self.refresh_books()
+        label = status.title() if status else "cleared"
+        self.status_var.set(
+            f"Reading status {label} on {len(book_ids)} "
+            f"book{'s' if len(book_ids) != 1 else ''}."
+        )
 
     def set_accessibility_feature_filter(self):
         value = AccessibleSingleFieldDialog.ask(
@@ -2076,6 +2126,45 @@ class LibraryApp:
         except Exception:
             pass
 
+    def announce_progress(self, message: str, force: bool = False) -> None:
+        """Rate-limited progress announcement for long-running work.
+
+        Ensures at least ``_progress_announcement_min_gap`` seconds pass
+        between spoken updates so the screen reader is informed without
+        being spammed. Safe to call from a worker thread: the actual
+        speech dispatch is scheduled onto the Tk main loop.
+
+        Pass force=True for the final "done" message.
+        """
+        text = re.sub(r"\s+", " ", message or "").strip()
+        if not text:
+            return
+
+        def do_announce():
+            now = time.monotonic()
+            if not force and (now - self._last_progress_announcement_at) < self._progress_announcement_min_gap:
+                return
+            self._last_progress_announcement_at = now
+            try:
+                self.status_var.set(text)
+            except Exception:
+                logger.debug("status_var set failed", exc_info=True)
+            controller = self.get_nvda_controller()
+            if controller is None:
+                return
+            try:
+                if controller.nvdaController_testIfRunning() != 0:
+                    return
+                controller.nvdaController_speakText(text)
+                self.last_nvda_announcement = text
+            except Exception:
+                logger.debug("NVDA speak failed", exc_info=True)
+
+        try:
+            self.root.after(0, do_announce)
+        except Exception:
+            logger.debug("Could not schedule announcement", exc_info=True)
+
     def speak_text(self, text):
         text = re.sub(r"\s+", " ", text or "").strip()
         if not text:
@@ -2389,6 +2478,7 @@ class LibraryApp:
             path = Path(stored_path)
             if not path.exists():
                 return
+            self.announce_progress(f"Indexing {path.name}")
             text = extract_text_for_indexing(path)
             self.db.index_book_content(book_id, text)
             if path.suffix.lower() == ".pdf":
@@ -2550,6 +2640,57 @@ class LibraryApp:
             self.status_var.set("Library backup failed.")
             if not automatic:
                 messagebox.showerror("Library Backup Failed", f"Could not back up the library database and imported book files.\n\n{exc}")
+
+    def verify_last_backup(self):
+        """Open the backup DB read only and run PRAGMA integrity_check."""
+        folder, backup_file, _manifest = self.backup_paths()
+        if not folder or not backup_file or not backup_file.exists():
+            messagebox.showinfo(
+                "No backup found",
+                "No backup file exists yet. Choose a backup folder and use Back Up Now first."
+            )
+            return
+
+        self.status_var.set("Verifying last backup.")
+        try:
+            uri = f"file:{backup_file.as_posix()}?mode=ro"
+            connection = sqlite3.connect(uri, uri=True)
+            try:
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()
+                book_count_row = connection.execute("SELECT COUNT(*) FROM books").fetchone()
+                integrity_result = integrity[0] if integrity else "unknown"
+                backed_up_books = book_count_row[0] if book_count_row else 0
+            finally:
+                connection.close()
+        except Exception as exc:
+            logger.exception("Backup verification failed to open %s", backup_file)
+            self.status_var.set("Backup verification failed.")
+            messagebox.showerror(
+                "Backup verification failed",
+                f"Could not open the backup database.\n\n{exc}"
+            )
+            return
+
+        live_books = self.db.connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+        ok = integrity_result.lower() == "ok"
+        header = "Backup verified OK." if ok else "Backup integrity check reported problems."
+        body = (
+            f"{header}\n\n"
+            f"Backup file: {backup_file}\n"
+            f"Integrity: {integrity_result}\n"
+            f"Books in backup: {backed_up_books}\n"
+            f"Books in current library: {live_books}\n"
+        )
+        if backed_up_books != live_books:
+            body += (
+                "\nBook counts differ, which is expected if you added or removed books "
+                "since the last backup. Use Back Up Now to refresh."
+            )
+        self.status_var.set(f"Backup verify: {integrity_result}, {backed_up_books} books.")
+        if ok:
+            messagebox.showinfo("Backup verified", body)
+        else:
+            messagebox.showwarning("Backup integrity check", body)
 
     def backup_file_is_valid(self, backup_file):
         try:
@@ -2887,7 +3028,7 @@ class LibraryApp:
                 if source_path.resolve() == stored_path.resolve():
                     return row
             except Exception:
-                pass
+                logger.debug("Path resolve failed while matching %s against stored %s", source_path, stored_path, exc_info=True)
 
             try:
                 stored_stat = stored_path.stat()
@@ -3363,6 +3504,7 @@ class LibraryApp:
             accessibility_feature_filter=self.filter_accessibility_feature,
             accessibility_hazard_filter=self.filter_accessibility_hazard,
             content_flag_filter=self.filter_content_flag,
+            reading_status_filter=self.filter_reading_status,
             extra_ids=content_ids,
         )
         for row in rows:
@@ -4518,6 +4660,7 @@ class LibraryApp:
             return
 
         rows = self.db.all_books_for_duplicate_check()
+        total = len(rows)
         scanned = 0
         updated = 0
         skipped = 0
@@ -4532,12 +4675,17 @@ class LibraryApp:
                 scanned += 1
                 if metadata:
                     updated += 1
+                if scanned % 5 == 0 or scanned == 1:
+                    self.announce_progress(
+                        f"Scanning accessibility metadata: {scanned} of about {total} books."
+                    )
             except Exception:
                 logger.exception("Bulk accessibility detection failed for book id=%s", book_id)
                 skipped += 1
         self.refresh_books()
-        self.status_var.set(
-            f"Accessibility metadata: scanned {scanned}, updated {updated}, skipped {skipped}."
+        self.announce_progress(
+            f"Accessibility metadata scan complete. Scanned {scanned}, updated {updated}, skipped {skipped}.",
+            force=True,
         )
         messagebox.showinfo(
             "Detect Accessibility Metadata",
@@ -4649,7 +4797,7 @@ class LibraryApp:
                                     data = updated.encode("utf-8")
                                     inserted_total += inserted
                             except Exception:
-                                pass
+                                logger.debug("Skipped page-break insertion for %s", item, exc_info=True)
                     target_archive.writestr(item, data)
 
         if inserted_total:
@@ -4945,7 +5093,7 @@ class LibraryApp:
                     try:
                         xhtml_documents.append((item.filename, source_archive.read(item.filename).decode("utf-8", errors="ignore")))
                     except Exception:
-                        pass
+                        logger.debug("Skipped XHTML doc during clean: %s", item.filename, exc_info=True)
             repeated = self.repeated_paragraphs_for_cleanup(xhtml_documents)
             language_text = "\n".join(
                 strip_xml_html_tags_preserve_lines(text)
@@ -5210,6 +5358,10 @@ class LibraryApp:
             else:
                 subprocess.Popen(["xdg-open", path])
             self.status_var.set(f"Opened {row[1]}.")
+            try:
+                self.db.stamp_book_opened(book_id)
+            except Exception:
+                logger.exception("Failed to stamp opened_at for book id=%s", book_id)
         except Exception as exc:
             messagebox.showerror("Open failed", f"Could not open this book.\n\n{exc}")
 
