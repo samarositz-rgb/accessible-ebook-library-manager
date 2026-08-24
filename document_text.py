@@ -246,6 +246,43 @@ def read_text_from_pdf(pdf_path: Path, max_chars: int = 50000) -> str:
     return text[:max_chars]
 
 
+SCANNED_PDF_MIN_CHARS_PER_PAGE = 100
+SCANNED_PDF_SAMPLE_PAGES = 10
+
+
+def is_pdf_probably_image_only(pdf_path: Path) -> bool:
+    """Return True if a PDF appears to be scanned images with no OCR text layer.
+
+    Samples up to ``SCANNED_PDF_SAMPLE_PAGES`` pages. If the average extracted
+    character count is below ``SCANNED_PDF_MIN_CHARS_PER_PAGE``, the PDF is
+    almost certainly image-only and will be silent to a screen reader.
+
+    Requires pypdf. If pypdf is missing or the file cannot be read, returns
+    False (conservative: better to not flag than to flag good books).
+    """
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return False
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception:
+        return False
+    pages = reader.pages
+    if not pages:
+        return False
+    sample = min(SCANNED_PDF_SAMPLE_PAGES, len(pages))
+    total_chars = 0
+    for page in pages[:sample]:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        total_chars += len(text.strip())
+    average = total_chars / sample
+    return average < SCANNED_PDF_MIN_CHARS_PER_PAGE
+
+
 def read_text_for_metadata_detection(path: Path, max_chars: int = 50000) -> str:
     suffix = path.suffix.lower()
     if suffix == ".epub":

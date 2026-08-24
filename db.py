@@ -14,7 +14,7 @@ from pathlib import Path
 
 DB_NAME = "library.db"
 BOOKS_FOLDER = "Books"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 ACCESSIBILITY_METADATA_KEYS = [
     "accessibility_summary",
@@ -149,11 +149,15 @@ class LibraryDatabase:
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_author ON books(author COLLATE NOCASE)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_format ON books(format)")
-        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_year ON books(year)")
         self.connection.commit()
+        # ensure_book_columns must run before any index that references a
+        # dynamically-added column (e.g. year) is created, because on a fresh
+        # database those columns do not exist until this call adds them.
         if int(self.get_setting("schema_version", "0")) < SCHEMA_VERSION:
             self.ensure_book_columns()
             self.set_setting("schema_version", str(SCHEMA_VERSION))
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_year ON books(year)")
+        self.connection.commit()
 
     def ensure_book_columns(self):
         """Add newer metadata columns to existing libraries without deleting data."""
@@ -171,6 +175,8 @@ class LibraryDatabase:
             "accessibility_access_modes_sufficient": "TEXT DEFAULT ''",
             "accessibility_certified_by": "TEXT DEFAULT ''",
             "content_indexed_at": "TEXT DEFAULT NULL",
+            "content_flags": "TEXT DEFAULT ''",
+            "source_book_id": "TEXT DEFAULT ''",
         }
         for name, column_type in columns.items():
             if name not in existing:
@@ -270,6 +276,39 @@ class LibraryDatabase:
         )
         self.connection.commit()
 
+    def set_content_flags(self, book_id: int, flags: str) -> None:
+        """Store the comma-separated content_flags string for a book."""
+        self.connection.execute(
+            "UPDATE books SET content_flags = ? WHERE id = ?",
+            (flags or "", book_id),
+        )
+        self.connection.commit()
+
+    def get_content_flags(self, book_id: int) -> list[str]:
+        cursor = self.connection.execute(
+            "SELECT content_flags FROM books WHERE id = ?", (book_id,)
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return []
+        return [flag.strip() for flag in row[0].split(",") if flag.strip()]
+
+    def set_source_book_id(self, book_id: int, source_book_id: str) -> None:
+        self.connection.execute(
+            "UPDATE books SET source_book_id = ? WHERE id = ?",
+            (source_book_id or "", book_id),
+        )
+        self.connection.commit()
+
+    def get_book_by_source_book_id(self, source_book_id: str):
+        if not source_book_id:
+            return None
+        cursor = self.connection.execute(
+            "SELECT id, title, author, stored_path FROM books WHERE source_book_id = ? LIMIT 1",
+            (source_book_id,),
+        )
+        return cursor.fetchone()
+
     def update_cover_url(self, book_id, cover_url=""):
         self.connection.execute(
             "UPDATE books SET cover_url = ? WHERE id = ?",
@@ -365,11 +404,25 @@ class LibraryDatabase:
         )
         return cursor.fetchone()
 
-    def search_books(self, query="", sort_by="title", source_filter="", tag_filter="", format_filter="", extra_ids=None):
+    def search_books(
+        self,
+        query="",
+        sort_by="title",
+        source_filter="",
+        tag_filter="",
+        format_filter="",
+        accessibility_feature_filter="",
+        accessibility_hazard_filter="",
+        content_flag_filter="",
+        extra_ids=None,
+    ):
         query = query.strip()
         source_filter = source_filter.strip()
         tag_filter = tag_filter.strip()
         format_filter = format_filter.strip().lower()
+        accessibility_feature_filter = accessibility_feature_filter.strip()
+        accessibility_hazard_filter = accessibility_hazard_filter.strip()
+        content_flag_filter = content_flag_filter.strip()
 
         order_map = {
             "title": "title COLLATE NOCASE ASC, author COLLATE NOCASE ASC",
@@ -426,6 +479,18 @@ class LibraryDatabase:
         if format_filter:
             conditions.append("format LIKE ?")
             params.append(f"%{format_filter}%")
+
+        if accessibility_feature_filter:
+            conditions.append("accessibility_features LIKE ?")
+            params.append(f"%{accessibility_feature_filter}%")
+
+        if accessibility_hazard_filter:
+            conditions.append("accessibility_hazards LIKE ?")
+            params.append(f"%{accessibility_hazard_filter}%")
+
+        if content_flag_filter:
+            conditions.append("content_flags LIKE ?")
+            params.append(f"%{content_flag_filter}%")
 
         where_clause = ""
         if conditions:

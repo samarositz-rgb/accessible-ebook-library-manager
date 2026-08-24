@@ -75,6 +75,7 @@ from document_text import (
     detect_language_from_text,
     extract_text_for_indexing,
     is_pdf_extraction_degraded,
+    is_pdf_probably_image_only,
     read_text_from_epub_preserve_lines,
     read_text_for_metadata_detection,
     strip_xml_html_tags,
@@ -264,6 +265,44 @@ def read_epub_metadata(epub_path: Path) -> dict:
         }
     except Exception:
         return {}
+
+
+def extract_source_book_id(epub_path: Path) -> str:
+    """Pull an accessible-library-specific book ID from an EPUB's OPF metadata.
+
+    Returns strings like "bookshare:12345" or "learningally:BR12345" when the
+    EPUB's dc:identifier declares one. Returns an empty string when no known
+    scheme is present, so re-download dedup only kicks in for high-confidence
+    matches.
+    """
+    try:
+        opf_path = get_epub_opf_path(epub_path)
+        with zipfile.ZipFile(epub_path, "r") as archive:
+            opf_xml = archive.read(opf_path)
+        root = _safe_fromstring(opf_xml)
+    except Exception:
+        return ""
+
+    ns = {"opf": OPF_NS, "dc": DC_NS}
+    for identifier in root.findall(".//dc:identifier", ns):
+        text = (identifier.text or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        scheme = identifier.attrib.get(f"{{{OPF_NS}}}scheme", "").lower()
+        if "bookshare" in lowered or "bookshare" in scheme:
+            digits = re.sub(r"[^0-9]", "", text)
+            if digits:
+                return f"bookshare:{digits}"
+        if "learningally" in lowered or "learningally" in scheme or lowered.startswith("br"):
+            token = re.sub(r"[^A-Za-z0-9]", "", text.upper())
+            if token:
+                return f"learningally:{token}"
+        if "urn:isbn:" in lowered:
+            digits = re.sub(r"[^0-9Xx]", "", text)
+            if len(digits) in (10, 13):
+                return f"isbn:{digits.upper()}"
+    return ""
 
 
 def metadata_values_by_property(root, property_name):
@@ -1324,6 +1363,9 @@ class LibraryApp:
         self.filter_source = ""
         self.filter_tag = ""
         self.filter_format = ""
+        self.filter_accessibility_feature = ""
+        self.filter_accessibility_hazard = ""
+        self.filter_content_flag = ""
         self.backup_check_after = None
         self.watched_scan_after = None
         self.watched_scan_running = False
@@ -1371,6 +1413,7 @@ class LibraryApp:
         book_menu.add_command(label="Auto-Detect Metadata...\tCtrl+D", command=self.auto_detect_selected_metadata)
         repair_menu = Menu(book_menu, tearoff=False)
         repair_menu.add_command(label="Check EPUB Accessibility Metadata...", command=self.check_selected_epub_accessibility)
+        repair_menu.add_command(label="Detect Accessibility Metadata for All Books...", command=self.detect_accessibility_for_all_books)
         repair_menu.add_command(label="Add EPUB Page Breaks from Page Labels...", command=self.add_page_breaks_to_selected_epub)
         repair_menu.add_command(label="Rebuild EPUB Table of Contents from Text TOC...", command=self.rebuild_selected_epub_toc_from_text)
         repair_menu.add_command(label="Clean Repaired EPUB Text...", command=self.clean_selected_epub_text)
@@ -1404,6 +1447,11 @@ class LibraryApp:
         filter_menu.add_command(label="By Source...", command=self.set_source_filter)
         filter_menu.add_command(label="By Tag...", command=self.set_tag_filter)
         filter_menu.add_command(label="By Format...", command=self.set_format_filter)
+        filter_menu.add_separator()
+        filter_menu.add_command(label="By Accessibility Feature...", command=self.set_accessibility_feature_filter)
+        filter_menu.add_command(label="By Accessibility Hazard...", command=self.set_accessibility_hazard_filter)
+        filter_menu.add_command(label="By Content Flag...", command=self.set_content_flag_filter)
+        filter_menu.add_separator()
         filter_menu.add_command(label="Clear Filters", command=self.clear_filters)
         organize_menu.add_cascade(label="Filter", menu=filter_menu)
         organize_menu.add_separator()
@@ -1609,6 +1657,12 @@ class LibraryApp:
             parts.append(f"tag contains {self.filter_tag}")
         if self.filter_format:
             parts.append(f"format contains {self.filter_format}")
+        if self.filter_accessibility_feature:
+            parts.append(f"accessibility feature contains {self.filter_accessibility_feature}")
+        if self.filter_accessibility_hazard:
+            parts.append(f"accessibility hazard contains {self.filter_accessibility_hazard}")
+        if self.filter_content_flag:
+            parts.append(f"content flag contains {self.filter_content_flag}")
         if not parts:
             return "No filters"
         return "; ".join(parts)
@@ -1665,9 +1719,67 @@ class LibraryApp:
         self.filter_source = ""
         self.filter_tag = ""
         self.filter_format = ""
+        self.filter_accessibility_feature = ""
+        self.filter_accessibility_hazard = ""
+        self.filter_content_flag = ""
         self.refresh_books()
         self.focus_books_list()
         self.status_var.set("Filters cleared.")
+
+    def set_accessibility_feature_filter(self):
+        value = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "Accessibility Feature Filter",
+            "Enter an accessibility feature to filter by, such as structuralNavigation, "
+            "alternativeText, pageNavigation, tableOfContents, readingOrder, MathML, "
+            "displayTransformability, or synchronizedAudioText. Leave blank to clear.",
+            self.filter_accessibility_feature,
+        )
+        if value is None:
+            return
+        self.filter_accessibility_feature = value.strip()
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set(
+            f"Accessibility feature filter set. {self.book_list.size()} "
+            f"book{'s' if self.book_list.size() != 1 else ''} shown."
+        )
+
+    def set_accessibility_hazard_filter(self):
+        value = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "Accessibility Hazard Filter",
+            "Enter an accessibility hazard to filter by, such as none, unknown, "
+            "flashing, motionSimulation, or sound. Leave blank to clear.",
+            self.filter_accessibility_hazard,
+        )
+        if value is None:
+            return
+        self.filter_accessibility_hazard = value.strip()
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set(
+            f"Accessibility hazard filter set. {self.book_list.size()} "
+            f"book{'s' if self.book_list.size() != 1 else ''} shown."
+        )
+
+    def set_content_flag_filter(self):
+        value = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "Content Flag Filter",
+            "Enter a content flag to filter by, such as image_only_pdf. "
+            "Leave blank to clear.",
+            self.filter_content_flag,
+        )
+        if value is None:
+            return
+        self.filter_content_flag = value.strip()
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set(
+            f"Content flag filter set. {self.book_list.size()} "
+            f"book{'s' if self.book_list.size() != 1 else ''} shown."
+        )
 
     def show_organize_settings(self):
         messagebox.showinfo(
@@ -2279,8 +2391,44 @@ class LibraryApp:
                 return
             text = extract_text_for_indexing(path)
             self.db.index_book_content(book_id, text)
+            if path.suffix.lower() == ".pdf":
+                self._flag_pdf_if_image_only(book_id, path)
+            elif path.suffix.lower() == ".epub":
+                self._capture_source_book_id(book_id, path)
         except Exception:
             logger.exception("Failed to index book id=%s path=%s", book_id, stored_path)
+
+    def _capture_source_book_id(self, book_id: int, epub_path: Path) -> None:
+        """Extract and store a Bookshare / Learning Ally / ISBN identifier from an EPUB.
+
+        Empty result is fine and means the OPF did not declare one we recognize.
+        """
+        try:
+            source_book_id = extract_source_book_id(epub_path)
+        except Exception:
+            logger.exception("Source ID extraction failed for book id=%s", book_id)
+            return
+        if source_book_id:
+            self.db.set_source_book_id(book_id, source_book_id)
+
+    def _flag_pdf_if_image_only(self, book_id: int, pdf_path: Path) -> None:
+        """If this PDF appears to be scanned images with no text layer, tag it.
+
+        The flag ``image_only_pdf`` becomes filterable and is surfaced in the
+        book details. Called from the background indexer thread; the LibraryDatabase
+        connection is thread-safe.
+        """
+        try:
+            if not is_pdf_probably_image_only(pdf_path):
+                return
+        except Exception:
+            logger.exception("Image-only PDF check failed for id=%s", book_id)
+            return
+        existing = self.db.get_content_flags(book_id)
+        if "image_only_pdf" in existing:
+            return
+        existing.append("image_only_pdf")
+        self.db.set_content_flags(book_id, ",".join(existing))
 
     def _check_pdf_extraction_health(self):
         """If we fell back to raw-bytes PDF scraping, warn the user once."""
@@ -3212,6 +3360,9 @@ class LibraryApp:
             source_filter=self.filter_source,
             tag_filter=self.filter_tag,
             format_filter=self.filter_format,
+            accessibility_feature_filter=self.filter_accessibility_feature,
+            accessibility_hazard_filter=self.filter_accessibility_hazard,
+            content_flag_filter=self.filter_content_flag,
             extra_ids=content_ids,
         )
         for row in rows:
@@ -4355,6 +4506,44 @@ class LibraryApp:
         self.update_accessibility_from_epub(book_id, row[8])
         self.refresh_books(selected_book_id=book_id)
         self.focus_books_list()
+
+    def detect_accessibility_for_all_books(self):
+        """Re-run EPUB accessibility metadata detection across the whole library."""
+        if not messagebox.askyesno(
+            "Detect Accessibility Metadata",
+            "This scans every EPUB in your library and updates accessibility metadata (features, "
+            "hazards, access modes, summary). It reads files, does not modify them. "
+            "It can take a moment for large libraries. Proceed?"
+        ):
+            return
+
+        rows = self.db.all_books_for_duplicate_check()
+        scanned = 0
+        updated = 0
+        skipped = 0
+        for row in rows:
+            book_id = row[0]
+            stored_path = Path(row[8])
+            if stored_path.suffix.lower() != ".epub" or not stored_path.exists():
+                skipped += 1
+                continue
+            try:
+                metadata = self.update_accessibility_from_epub(book_id, stored_path)
+                scanned += 1
+                if metadata:
+                    updated += 1
+            except Exception:
+                logger.exception("Bulk accessibility detection failed for book id=%s", book_id)
+                skipped += 1
+        self.refresh_books()
+        self.status_var.set(
+            f"Accessibility metadata: scanned {scanned}, updated {updated}, skipped {skipped}."
+        )
+        messagebox.showinfo(
+            "Detect Accessibility Metadata",
+            f"Scanned {scanned} EPUBs. Updated metadata on {updated}. Skipped {skipped} "
+            "(missing files or non-EPUB books)."
+        )
 
     def check_selected_epub_accessibility(self):
         book_id = self.selected_book_id()
