@@ -17,7 +17,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Python needs working PySide6 and PyInstaller installations.' }
     & $python prepare_braille_runtime.py
     if ($LASTEXITCODE -ne 0) { throw 'The bundled braille converter could not be verified.' }
-    & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name 'Accessible Ebook Library Manager' --add-data "$source\vendor\braille;vendor\braille" --add-data "$root\Documentation\Braille Export Guide.md;." --distpath $stage --workpath (Join-Path $build 'PyInstaller') --specpath $build qt_library_manager.py
+    & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name 'Accessible Ebook Library Manager' --add-data "$source\vendor\braille;vendor\braille" --add-data "$root\Documentation\Braille Export Guide.md;." --add-data "$root\Documentation\Accessible Ebook Library Manager Help.txt;." --distpath $stage --workpath (Join-Path $build 'PyInstaller') --specpath $build qt_library_manager.py
     if ($LASTEXITCODE -ne 0) { throw 'Application build failed. The previous application was preserved.' }
 } finally { Pop-Location }
 $built = Join-Path $stage 'Accessible Ebook Library Manager'

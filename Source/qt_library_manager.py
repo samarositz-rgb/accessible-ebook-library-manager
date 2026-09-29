@@ -74,6 +74,7 @@ from PySide6.QtWidgets import (
 
 from library_manager import (
     APP_NAME,
+    app_data_folder,
     BACKUP_SCHEDULES,
     BOOKS_FOLDER,
     BOOK_LIST_ALPHABET_GROUPS,
@@ -101,6 +102,7 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
+from help_file import ensure_user_help, load_help_text
 from library_utils import (
     metadata_score_from_row,
     normalize_duplicate_key,
@@ -4246,42 +4248,25 @@ class QtLibraryWindow(QMainWindow):
         help_text = QTextEdit(dialog)
         help_text.setAccessibleName("Help topics")
         help_text.setReadOnly(True)
-        help_text.setPlainText(
-            "Keyboard commands\n\n"
-            "Up and Down Arrow: Move through books. Left and Right Arrow: Move between alphabetical lists.\n"
-            "Type a letter: Jump to the next title beginning with that letter; leading The and A are ignored.\n"
-            "Enter: Open the current book. F2: Edit its metadata. Ctrl+I: Show book details. Delete: Remove books from the library (stored files are kept).\n"
-            "Ctrl+Space: Mark or unmark the current book for batch actions. Ctrl+A marks all books currently shown; Ctrl+Shift+A clears the marked selection.\n"
-            "Ctrl+F: Search metadata and indexed book text. Escape clears the search. Ctrl+L returns focus to the book list.\n"
-            "Ctrl+1 selects one list; Ctrl+2 selects alphabetical groups; Ctrl+3 selects one column per letter; Ctrl+4 selects tag columns. These layouts are also under Organize > Book List Display. Ctrl+N adds a book; Ctrl+Shift+N imports a folder.\n"
-            "Ctrl+O opens the current book. Ctrl+E exports selected books. Ctrl+K opens Kindle for PC. Ctrl+Shift+K sends books to Kindle.\n"
-            "Ctrl+Shift+V sends books to Voice Dream. Ctrl+Shift+E sends books to an NLS eReader. Ctrl+R converts selected books to EPUB. Ctrl+D detects metadata.\n"
-            "Alt+1 through Alt+0 read the corresponding configured book-list detail. Press the same shortcut twice quickly to edit that field.\n\n"
-            "Book list and selection\n\n"
-            "Each book is presented as focusable text so common screen readers can read the full title without announcing a changing item count. Open Settings > Settings, then the Book List Reading tab to choose spoken details. The visual cover preview is not included in book-list speech.\n"
-            "Organize > Category Layout chooses Columns or Rows for grouped views. Columns use Left and Right Arrow between categories and Up and Down Arrow between books. Rows use Up and Down Arrow between categories and Left and Right Arrow between books. Entering a category identifies it and the current book. The preference is remembered. Ctrl+1 returns to a single list, where Up and Down still move between books.\n"
-            "Ctrl+Space marks books for batch actions. When any books are marked, batch commands act on those books; otherwise they act on the current book.\n\n"
-            "Books and repairs\n\n"
-            "Book > Edit Metadata changes book details. Bulk Edit applies entered fields to every marked book. Find Missing Metadata Wizard (Ctrl+D) reads the book, then checks Open Library and Google Books, preserving existing values for review before saving. Look Up Metadata Online can also fill missing details. Find Cover Image Online searches for a cover without changing other metadata.\n"
-            "Book > Repair contains the cleanup wizard, EPUB accessibility check, page-break repair, table-of-contents rebuild, text cleanup, combining book parts, and repair-backup removal. Repair operations preserve a backup copy.\n"
-            "Book > Convert Selected Books to EPUB adds converted copies to the library and keeps originals. Export offers original formats or EPUB copies; export does not change books in the library. EPUB conversion requires Calibre's ebook-convert tool.\n"
-            "File > Send To includes Voice Dream, Dolphin EasyReader, NLS eReader, Kindle, and HumanWare MTP. Device and folder setup is in Settings.\n\n"
-            "Search and organization\n\n"
-            "Search covers book metadata and indexed text. Use Search > Re-index Book Content to build or refresh text search. Escape clears search and restores the full list.\n"
-            "Organize includes sorting, filters, saved views, duplicate removal, and automatic duplicate cleanup. Duplicate cleanup removes duplicate library records, not the book files.\n\n"
-            "Settings and safety\n\n"
-            "Settings > Settings opens categorized tabs. Ctrl+Tab and Ctrl+Shift+Tab switch categories; Tab moves through their controls. Choose a command to open its existing setup dialog. Categories include book-list speech, missing-metadata sound, backups, watched folders, default reader, Kindle addresses, and Calibre tools. Display layouts remain under Organize.\n"
-            "The Feedback tab controls optional supplementary status announcements, off by default. Help > Review Recent Messages lists the latest 10 status messages for this session, newest first. Use Up and Down Arrow to review them. Messages remain available after the status bar clears. Alt+number metadata reading remains available regardless of this setting.\n"
-            "Invalid metadata stays in the editor for correction. Closing an edited metadata dialog asks before discarding changes. Cancel stops supported background jobs after the current book or step; completed work is kept. Backup, restore, and individual repair steps must finish safely. Closing during active work asks before waiting, and the interface remains responsive.\n"
-            "Backups include the library database and imported book files. Watched folders are scanned for new or changed books and ignore known Voice Dream library notice files. Restore checks the backup before replacing library data."
-        )
+        help_text.setPlainText(load_help_text(app_data_folder()))
         layout.addWidget(help_text)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        edit_button = buttons.addButton("Edit Help File", QDialogButtonBox.ButtonRole.ActionRole)
+        edit_button.clicked.connect(lambda: self.open_help_file_for_editing(dialog))
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
         help_text.setFocus(Qt.FocusReason.OtherFocusReason)
         dialog.exec()
+
+    def open_help_file_for_editing(self, dialog):
+        path = ensure_user_help(app_data_folder())
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception as exc:
+            QMessageBox.warning(dialog, "Help File", f"Could not open the help file:\n{path}\n\n{exc}")
+            return
+        dialog.accept()
 
     def choose_backup_folder(self):
         self.choose_cloud_backup_folder("other")
