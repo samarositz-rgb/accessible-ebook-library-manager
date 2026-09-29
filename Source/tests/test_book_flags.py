@@ -69,9 +69,14 @@ class SourceBookIdTests(unittest.TestCase):
         make_epub(path, "learningally-ab12345")
         self.assertEqual(extract_source_book_id(path), "learningally:AB12345")
 
+    def test_isbn_urn_identifier(self):
+        path = self.dir / "e.epub"
+        make_epub(path, "urn:isbn:9780306406157")
+        self.assertEqual(extract_source_book_id(path), "isbn:9780306406157")
+
     def test_unrelated_identifier_is_ignored(self):
         path = self.dir / "c.epub"
-        make_epub(path, "urn:isbn:9780306406157")
+        make_epub(path, "publisher-house-id-abc")
         self.assertEqual(extract_source_book_id(path), "")
 
     def test_bad_file_returns_empty(self):

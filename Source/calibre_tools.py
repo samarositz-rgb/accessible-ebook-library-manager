@@ -6,6 +6,10 @@ import sys
 import tempfile
 from pathlib import Path
 from xml.etree import ElementTree as ET
+try:
+    from defusedxml.ElementTree import fromstring as _safe_fromstring
+except ImportError:
+    from xml.etree.ElementTree import fromstring as _safe_fromstring
 
 
 CALIBRE_METADATA_EXTENSIONS = {
@@ -104,7 +108,7 @@ def parse_calibre_opf_metadata(opf_text: str) -> dict:
     if not opf_text.strip():
         return {}
 
-    root = ET.fromstring(opf_text.encode("utf-8"))
+    root = _safe_fromstring(opf_text.encode("utf-8"))
     authors = all_text(root, "creator")
     tags = all_text(root, "subject")
     pubdate = first_text(root, "date")

@@ -3,6 +3,7 @@ build/
 dist/
 vendor/braille/
 *.spec
+*.exe
 .codex_git_index_*
 Application/
 Archive/

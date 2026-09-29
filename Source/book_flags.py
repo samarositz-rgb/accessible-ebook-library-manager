@@ -80,10 +80,10 @@ def is_pdf_probably_image_only(pdf_path: Path) -> bool:
 
 
 def extract_source_book_id(epub_path: Path) -> str:
-    """Return ``bookshare:<id>`` or ``learningally:<id>`` from an EPUB, else ''.
+    """Return ``bookshare:<id>``, ``learningally:<id>`` or ``isbn:<digits>``, else ''.
 
-    Only identifiers that name one of those libraries are accepted, so an
-    unrelated publisher identifier can never be mistaken for a match.
+    Only those identifiers are accepted, so an unrelated publisher identifier
+    can never be mistaken for a match.
     """
     try:
         with zipfile.ZipFile(epub_path, "r") as archive:
@@ -109,6 +109,10 @@ def extract_source_book_id(epub_path: Path) -> str:
             tokens = re.findall(r"[A-Za-z]{0,3}\d{3,}", text)
             if tokens:
                 return f"learningally:{tokens[-1].upper()}"
+        if "urn:isbn:" in text.casefold():
+            digits = re.sub(r"[^0-9Xx]", "", text.casefold().replace("urn:isbn:", ""))
+            if len(digits) in (10, 13):
+                return f"isbn:{digits.upper()}"
     return ""
 
 
