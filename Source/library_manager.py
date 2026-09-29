@@ -41,7 +41,8 @@ import urllib.parse
 import urllib.request
 import winsound
 import ctypes
-from datetime import datetime, timedelta
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 try:
     import winreg
@@ -75,6 +76,7 @@ from document_text import (
     strip_xml_html_tags,
     strip_xml_html_tags_preserve_lines,
 )
+from book_flags import extract_source_book_id
 from library_utils import (
     folder_file_stats,
     metadata_score_from_detection,
@@ -86,6 +88,8 @@ from library_utils import (
     sync_folder_contents,
     title_keys_look_same,
 )
+from online_metadata import lookup_online_metadata
+from book_categories import normalize_import_tags
 
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,8 @@ VOICE_DREAM_LIBRARY_NOTICE = (
 BOOK_LIST_SPEECH_FIELDS = [
     ("title", "Title"),
     ("author", "Author"),
+    ("series", "Series"),
+    ("series_number", "Series number"),
     ("edition", "Edition"),
     ("year", "Year"),
     ("isbn", "ISBN"),
@@ -115,7 +121,31 @@ BOOK_LIST_SPEECH_FIELDS = [
     ("format", "Format"),
     ("added_at", "Date added"),
 ]
+BOOK_LIST_SHORTCUT_FIELDS = [
+    "title",
+    "author",
+    "series",
+    "series_number",
+    "edition",
+    "year",
+    "isbn",
+    "publisher",
+    "source",
+    "tags",
+]
 DEFAULT_BOOK_LIST_SPEECH_FIELDS = ["title", "author"]
+BOOK_LIST_DISPLAY_MODES = {
+    "single": "Single list",
+    "multiple": "Multiple alphabetical lists",
+}
+DEFAULT_BOOK_LIST_DISPLAY_MODE = "single"
+BOOK_LIST_ALPHABET_GROUPS = [
+    ("A-F", "abcdef"),
+    ("G-L", "ghijkl"),
+    ("M-R", "mnopqr"),
+    ("S-Z", "stuvwxyz"),
+    ("Other", ""),
+]
 NO_EDITION_VALUE = "No edition"
 ACCESSIBILITY_METADATA_KEYS = [
     "accessibility_summary",
@@ -134,10 +164,13 @@ BACKUP_SCHEDULES = {
     "monthly": ("Monthly", timedelta(days=30)),
 }
 DEFAULT_BACKUP_SCHEDULE = "on_demand"
+AUTOMATIC_DUPLICATE_CLEANUP_INTERVAL_MS = 30 * 60 * 1000
+DEFAULT_AUTOMATIC_DUPLICATE_CLEANUP = "0"
 MISSING_METADATA_SOUND_MODES = {
-    "author": ("Missing Author Only", ["author"]),
-    "useful": ("Missing Author, Edition, or Year", ["author", "edition", "year"]),
-    "complete": ("Missing Author, Edition, Year, ISBN, or Publisher", ["author", "edition", "year", "isbn", "publisher"]),
+    "tags": ("Missing Tags Only", ["tags"]),
+    "author": ("Missing Author or Tags", ["author", "tags"]),
+    "useful": ("Missing Author, Tags, Edition, or Year", ["author", "tags", "edition", "year"]),
+    "complete": ("Missing Author, Tags, Edition, Year, ISBN, or Publisher", ["author", "tags", "edition", "year", "isbn", "publisher"]),
 }
 DEFAULT_MISSING_METADATA_SOUND_MODE = "author"
 
@@ -149,7 +182,7 @@ ET.register_namespace("opf", OPF_NS)
 ET.register_namespace("dc", DC_NS)
 
 WINDOWS_NO_CONSOLE_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
 def find_nvda_controller_dll() -> Path | None:
@@ -215,7 +248,7 @@ def managed_books_folder(folder: Path) -> Path:
 
 
 def utc_now_text():
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).replace(microsecond=0).isoformat() + "Z"
 
 
 def parse_utc_text(value):
@@ -229,6 +262,17 @@ def parse_utc_text(value):
 
 def cloud_backup_subfolder(base_folder: Path) -> Path:
     return base_folder / "Accessible Ebook Library Manager Backups"
+
+
+def format_byte_count(byte_count: int) -> str:
+    size = float(max(byte_count, 0))
+    for unit in ["bytes", "KB", "MB", "GB"]:
+        if size < 1024 or unit == "GB":
+            if unit == "bytes":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
 
 
 def app_launch_command_for_file_argument():
@@ -287,10 +331,11 @@ class LibraryDatabase:
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_author ON books(author COLLATE NOCASE)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_added ON books(added_at)")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_format ON books(format)")
+        self.connection.commit()
+        self.ensure_book_columns()
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_year ON books(year)")
         self.connection.commit()
         if int(self.get_setting("schema_version", "0")) < SCHEMA_VERSION:
-            self.ensure_book_columns()
             self.set_setting("schema_version", str(SCHEMA_VERSION))
 
     def ensure_book_columns(self):
@@ -309,10 +354,15 @@ class LibraryDatabase:
             "accessibility_access_modes_sufficient": "TEXT DEFAULT ''",
             "accessibility_certified_by": "TEXT DEFAULT ''",
             "content_indexed_at": "TEXT DEFAULT NULL",
+            "series": "TEXT DEFAULT ''",
+            "series_number": "TEXT DEFAULT ''",
+            "content_flags": "TEXT DEFAULT ''",
+            "source_book_id": "TEXT DEFAULT ''",
         }
         for name, column_type in columns.items():
             if name not in existing:
                 self.connection.execute(f"ALTER TABLE books ADD COLUMN {name} {column_type}")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_books_series ON books(series COLLATE NOCASE)")
         self.connection.commit()
 
     def get_setting(self, key, default=""):
@@ -358,8 +408,9 @@ class LibraryDatabase:
     def search_content(self, query: str) -> set:
         if not query.strip():
             return set()
-        tokens = re.findall(r"\S+", query)
-        fts_query = " ".join(f'"{token}"' for token in tokens)
+        # Treat the user's words as one literal phrase, not an implicit AND
+        # between unrelated words anywhere in the book.
+        fts_query = '"' + query.strip().replace('"', '""') + '"'
         try:
             cursor = self.connection.execute(
                 "SELECT rowid FROM books_fts WHERE books_fts MATCH ?",
@@ -385,6 +436,7 @@ class LibraryDatabase:
         self.connection.commit()
 
     def add_book(self, title, author, source, tags, notes, original_path, stored_path):
+        tags = normalize_import_tags(tags)
         ext = Path(stored_path).suffix.lower().replace(".", "")
         cursor = self.connection.execute(
             """
@@ -407,6 +459,37 @@ class LibraryDatabase:
             (edition, year, isbn, publisher, book_id),
         )
         self.connection.commit()
+
+    def update_series_fields(self, book_id, series="", series_number=""):
+        self.connection.execute(
+            """
+            UPDATE books
+            SET series = ?, series_number = ?
+            WHERE id = ?
+            """,
+            (series, series_number, book_id),
+        )
+        self.connection.commit()
+
+    def update_bulk_metadata_fields(self, book_ids, values):
+        allowed = {
+            "author", "source", "tags", "notes", "edition", "year",
+            "publisher", "series",
+        }
+        fields = [key for key in allowed if key in values]
+        if not fields:
+            return 0
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        params = [values[key] for key in fields]
+        count = 0
+        for book_id in book_ids:
+            self.connection.execute(
+                f"UPDATE books SET {assignments} WHERE id = ?",
+                params + [book_id],
+            )
+            count += 1
+        self.connection.commit()
+        return count
 
     def update_cover_url(self, book_id, cover_url=""):
         self.connection.execute(
@@ -470,7 +553,8 @@ class LibraryDatabase:
             SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
                    edition, year, isbn, publisher, cover_url,
                    accessibility_summary, accessibility_features, accessibility_hazards,
-                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by,
+                   series, series_number
             FROM books
             ORDER BY title COLLATE NOCASE, author COLLATE NOCASE, added_at
             """
@@ -483,7 +567,8 @@ class LibraryDatabase:
             SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
                    edition, year, isbn, publisher, cover_url,
                    accessibility_summary, accessibility_features, accessibility_hazards,
-                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by,
+                   series, series_number
             FROM books WHERE id = ?
             """,
             (book_id,),
@@ -496,24 +581,69 @@ class LibraryDatabase:
             SELECT id, title, author, source, tags, notes, format, original_path, stored_path, added_at,
                    edition, year, isbn, publisher, cover_url,
                    accessibility_summary, accessibility_features, accessibility_hazards,
-                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by
+                   accessibility_access_modes, accessibility_access_modes_sufficient, accessibility_certified_by,
+                   series, series_number
             FROM books WHERE original_path = ?
             """,
             (original_path,),
         )
         return cursor.fetchone()
 
-    def search_books(self, query="", sort_by="title", source_filter="", tag_filter="", format_filter="", extra_ids=None):
+    def set_content_flags(self, book_id, flags):
+        """Store per-book notes such as image_only_pdf as a comma-separated list."""
+        cleaned = ",".join(dict.fromkeys(flag.strip() for flag in flags if flag and flag.strip()))
+        self.connection.execute("UPDATE books SET content_flags = ? WHERE id = ?", (cleaned, book_id))
+        self.connection.commit()
+
+    def get_content_flags(self, book_id):
+        row = self.connection.execute("SELECT content_flags FROM books WHERE id = ?", (book_id,)).fetchone()
+        return [flag for flag in (row[0] or "").split(",") if flag] if row else []
+
+    def set_source_book_id(self, book_id, source_book_id):
+        self.connection.execute("UPDATE books SET source_book_id = ? WHERE id = ?", (source_book_id or "", book_id))
+        self.connection.commit()
+
+    def get_source_book_id(self, book_id):
+        row = self.connection.execute("SELECT source_book_id FROM books WHERE id = ?", (book_id,)).fetchone()
+        return (row[0] or "") if row else ""
+
+    def find_book_id_by_source_book_id(self, source_book_id):
+        if not source_book_id:
+            return None
+        row = self.connection.execute(
+            "SELECT id FROM books WHERE source_book_id = ? ORDER BY id LIMIT 1", (source_book_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def source_book_ids_by_book(self):
+        return {
+            book_id: source_book_id
+            for book_id, source_book_id in self.connection.execute(
+                "SELECT id, source_book_id FROM books WHERE source_book_id <> ''"
+            )
+        }
+
+    def search_books(
+        self, query="", sort_by="title", source_filter="", tag_filter="", format_filter="", extra_ids=None,
+        accessibility_feature_filter="", exclude_hazard_filter="", content_flag_filter="",
+    ):
         query = query.strip()
         source_filter = source_filter.strip()
         tag_filter = tag_filter.strip()
         format_filter = format_filter.strip().lower()
+        accessibility_feature_filter = accessibility_feature_filter.strip()
+        # Hazards are whole values such as flashing or noFlashingHazard, so match them
+        # exactly; a plain substring test would treat "no flashing hazard" as flashing.
+        exclude_hazard_filter = re.sub(r"[^a-z0-9]", "", exclude_hazard_filter.casefold())
+        content_flag_filter = content_flag_filter.strip()
 
         order_map = {
             "title": "title COLLATE NOCASE ASC, author COLLATE NOCASE ASC",
             "title_desc": "title COLLATE NOCASE DESC, author COLLATE NOCASE ASC",
             "author": "author COLLATE NOCASE ASC, title COLLATE NOCASE ASC",
             "author_desc": "author COLLATE NOCASE DESC, title COLLATE NOCASE ASC",
+            "series": "series COLLATE NOCASE ASC, CAST(series_number AS REAL) ASC, title COLLATE NOCASE ASC",
+            "series_desc": "series COLLATE NOCASE DESC, CAST(series_number AS REAL) ASC, title COLLATE NOCASE ASC",
             "date": "year DESC, title COLLATE NOCASE ASC",
             "date_oldest": "year ASC, title COLLATE NOCASE ASC",
             "date_added": "added_at DESC, title COLLATE NOCASE ASC",
@@ -537,6 +667,8 @@ class LibraryDatabase:
                 " OR year LIKE ?"
                 " OR isbn LIKE ?"
                 " OR publisher LIKE ?"
+                " OR series LIKE ?"
+                " OR series_number LIKE ?"
                 " OR accessibility_summary LIKE ?"
                 " OR accessibility_features LIKE ?"
                 " OR accessibility_hazards LIKE ?"
@@ -547,11 +679,11 @@ class LibraryDatabase:
             if extra_ids:
                 placeholders = ",".join("?" * len(extra_ids))
                 conditions.append(f"({metadata_condition} OR id IN ({placeholders}))")
-                params.extend([like] * 16)
+                params.extend([like] * 18)
                 params.extend(extra_ids)
             else:
                 conditions.append(metadata_condition)
-                params.extend([like] * 16)
+                params.extend([like] * 18)
 
         if source_filter:
             conditions.append("source LIKE ?")
@@ -565,6 +697,18 @@ class LibraryDatabase:
             conditions.append("format LIKE ?")
             params.append(f"%{format_filter}%")
 
+        if accessibility_feature_filter:
+            conditions.append("accessibility_features LIKE ?")
+            params.append(f"%{accessibility_feature_filter}%")
+
+        if exclude_hazard_filter:
+            conditions.append("(',' || REPLACE(LOWER(accessibility_hazards), ' ', '') || ',') NOT LIKE ?")
+            params.append(f"%,{exclude_hazard_filter},%")
+
+        if content_flag_filter:
+            conditions.append("content_flags LIKE ?")
+            params.append(f"%{content_flag_filter}%")
+
         where_clause = ""
         if conditions:
             where_clause = "WHERE " + " AND ".join(conditions)
@@ -572,7 +716,7 @@ class LibraryDatabase:
         cursor = self.connection.execute(
             f"""
             SELECT id, title, author, source, tags, format, added_at,
-                   edition, year, isbn, publisher
+                   edition, year, isbn, publisher, series, series_number
             FROM books
             {where_clause}
             ORDER BY {order_clause}
@@ -610,6 +754,22 @@ def get_epub_opf_path(epub_path: Path) -> str:
     return opf_path
 
 
+def isbn_from_metadata_value(value: str) -> str:
+    """Accept an ISBN identifier, not a number embedded in a source name or URL."""
+    value = re.sub(r"[\u2010-\u2015]", "-", (value or "").strip())
+    value = re.sub(r"^(?:urn:isbn:|isbn(?:-1[03])?\s*:?\s*)", "", value, flags=re.IGNORECASE)
+    if not re.fullmatch(r"[0-9Xx\s-]+", value):
+        return ""
+    digits = re.sub(r"[\s-]", "", value).upper()
+    if len(digits) == 13 and digits.isdigit() and digits.startswith(("978", "979")):
+        if sum(int(char) * (1 if index % 2 == 0 else 3) for index, char in enumerate(digits)) % 10 == 0:
+            return digits
+    if len(digits) == 10 and digits[:9].isdigit() and (digits[-1].isdigit() or digits[-1] == "X"):
+        if sum((10 - index) * (10 if char == "X" else int(char)) for index, char in enumerate(digits)) % 11 == 0:
+            return digits
+    return ""
+
+
 def read_epub_metadata(epub_path: Path) -> dict:
     try:
         opf_path = get_epub_opf_path(epub_path)
@@ -623,11 +783,24 @@ def read_epub_metadata(epub_path: Path) -> dict:
             if subject.text:
                 subjects.append(subject.text.strip())
 
+        # dc:source may identify the print edition rather than the supplying
+        # service. Keep that ISBN out of Source and prefer this EPUB's identifier.
+        sources = [(element.text or "").strip() for element in root.findall(".//dc:source", ns)]
+        source = next((value for value in sources if value and not isbn_from_metadata_value(value)), "")
+        identifiers = []
+        unique_id = root.get("unique-identifier")
+        for element in root.findall(".//dc:identifier", ns):
+            isbn = isbn_from_metadata_value(element.text or "")
+            if isbn:
+                identifiers.append((element.get("id") == unique_id, len(isbn), isbn))
+        identifiers.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
         return {
             "title": first_or_empty(root, ".//dc:title", ns),
             "author": first_or_empty(root, ".//dc:creator", ns),
-            "source": first_or_empty(root, ".//dc:source", ns),
-            "tags": ", ".join(subjects),
+            "source": source,
+            "isbn": identifiers[0][2] if identifiers else "",
+            "tags": normalize_import_tags(subjects),
             "notes": first_or_empty(root, ".//dc:description", ns),
             "publisher": first_or_empty(root, ".//dc:publisher", ns),
             "year": first_or_empty(root, ".//dc:date", ns)[:4],
@@ -915,9 +1088,9 @@ def looks_like_standalone_heading_line(line: str):
         return False
     if re.match(r"^(?:chapter|part|section|appendix|index|front matter)\b", normalized, flags=re.IGNORECASE):
         return True
-    if re.match(r"^(?:Â§|Ã‚Â§)+\s*\d+(?:\.\d+)*\.?\s+\S+", normalized):
+    if re.match(r"^(?:\u00a7)+\s*\d+(?:\.\d+)*\.?\s+\S+", normalized):
         return True
-    if re.match(r"^[A-Z][A-Z0-9 ,;:'â€™\-\(\)&]{5,}$", normalized) and len(normalized.split()) <= 12:
+    if re.match(r"^[A-Z][A-Z0-9 ,;:'\u2019\-\(\)&]{5,}$", normalized) and len(normalized.split()) <= 12:
         return True
     return False
 
@@ -932,7 +1105,7 @@ def looks_like_heading_continuation_line(line: str):
         return False
     if re.search(r"\b(the|and|or|but|with|from|into|after|before|because|that|this|will|shall|must|have|has|was|were|are|is)\b", normalized, flags=re.IGNORECASE):
         return False
-    return bool(re.match(r"^[A-Z0-9Â§Ã‚Â§][A-Za-z0-9Â§Ã‚Â§ ,'\u2019\-\(\)&:]+$", normalized))
+    return bool(re.match(r"^[A-Z0-9\u00a7][A-Za-z0-9\u00a7 ,'\u2019\-\(\)&:]+$", normalized))
 
 
 def is_blank_page_notice(line: str):
@@ -1008,13 +1181,6 @@ def cleaned_lines_for_reflow(text: str):
             continue
         cleaned.append(line)
     return cleaned, removed
-
-
-def clean_metadata_line(line: str) -> str:
-    line = line.strip()
-    line = re.sub(r"\s+", " ", line)
-    line = re.sub(r"^[#*\\-â€“â€”: ]+", "", line)
-    return line.strip()
 
 
 def clean_metadata_line(line: str) -> str:
@@ -1126,6 +1292,34 @@ def extract_publisher_from_text(text: str) -> str:
     return ""
 
 
+def detect_series_fields(lines: list[str], existing: dict) -> tuple[str, str]:
+    series = existing.get("series", "") or ""
+    series_number = existing.get("series_number", "") or ""
+    if not series:
+        value = line_after_label(lines, ["series", "collection"], max_index=180)
+        if value:
+            series = clean_metadata_line(value)
+    if not series_number:
+        value = line_after_label(lines, ["series number", "book number", "volume", "vol"], max_index=180)
+        if value:
+            match = re.search(r"\d+(?:\.\d+)?", value)
+            series_number = match.group(0) if match else clean_metadata_line(value)
+    if (not series or not series_number):
+        for line in lines[:180]:
+            match = re.search(
+                r"\b(?:book|volume|vol\.?)\s+(\d+(?:\.\d+)?)\s+(?:of|in)\s+(.+)",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                if not series_number:
+                    series_number = match.group(1)
+                if not series:
+                    series = clean_metadata_line(match.group(2))
+                break
+    return series, series_number
+
+
 def clean_filename_title(path: Path) -> str:
     title = path.stem
     title = re.sub(r"[_]+", " ", title)
@@ -1148,7 +1342,7 @@ def is_weak_title(title: str, path: Path) -> bool:
 
 def clean_author_value(value: str) -> str:
     value = clean_metadata_line(value)
-    value = re.sub(r"^(?:by|author|authors|written by|edited by)\s*[:\-]?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:by|authors?|written by|edited by)\b\s*[:\-]?\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+(?:narrated by|read by|bookshare|copyright|all rights reserved).*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s+", " ", value).strip(" .;,")
     if value.isupper() and len(value.split()) <= 8:
@@ -1366,126 +1560,7 @@ def looks_like_author(value: str) -> bool:
     return True
 
 
-def fetch_json(url: str, timeout: int = 12) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "AccessibleEbookLibraryManager/1.0",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8", errors="ignore"))
-
-
-def normalize_online_metadata(metadata: dict) -> dict:
-    result = {
-        "title": metadata.get("title", ""),
-        "author": metadata.get("author", ""),
-        "edition": metadata.get("edition", ""),
-        "year": metadata.get("year", ""),
-        "isbn": metadata.get("isbn", ""),
-        "publisher": metadata.get("publisher", ""),
-        "source": metadata.get("source", ""),
-        "tags": metadata.get("tags", ""),
-        "notes": metadata.get("notes", ""),
-        "cover_url": metadata.get("cover_url", ""),
-    }
-    for key, value in list(result.items()):
-        if isinstance(value, list):
-            result[key] = ", ".join(str(item) for item in value if item)
-        elif value is None:
-            result[key] = ""
-        else:
-            result[key] = str(value).strip()
-    if result["year"]:
-        match = re.search(r"\b(1[5-9]\d{2}|20\d{2})\b", result["year"])
-        if match:
-            result["year"] = match.group(1)
-    return result
-
-
-def metadata_from_open_library_doc(doc: dict) -> dict:
-    isbn_values = doc.get("isbn") or []
-    tags = doc.get("subject") or []
-    cover_id = doc.get("cover_i")
-    cover_url = f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg" if cover_id else ""
-    return normalize_online_metadata({
-        "title": doc.get("title", ""),
-        "author": ", ".join(doc.get("author_name") or []),
-        "year": str(doc.get("first_publish_year") or ""),
-        "isbn": isbn_values[0] if isbn_values else "",
-        "publisher": (doc.get("publisher") or [""])[0],
-        "tags": ", ".join(tags[:8]),
-        "cover_url": cover_url,
-    })
-
-
-def metadata_from_google_volume(volume: dict) -> dict:
-    info = volume.get("volumeInfo", {})
-    identifiers = info.get("industryIdentifiers") or []
-    isbn = ""
-    for identifier in identifiers:
-        if identifier.get("type") == "ISBN_13":
-            isbn = identifier.get("identifier", "")
-            break
-    if not isbn and identifiers:
-        isbn = identifiers[0].get("identifier", "")
-    categories = info.get("categories") or []
-    image_links = info.get("imageLinks") or {}
-    cover_url = image_links.get("large") or image_links.get("medium") or image_links.get("thumbnail") or ""
-    return normalize_online_metadata({
-        "title": info.get("title", ""),
-        "author": ", ".join(info.get("authors") or []),
-        "year": info.get("publishedDate", ""),
-        "isbn": isbn,
-        "publisher": info.get("publisher", ""),
-        "tags": ", ".join(categories[:8]),
-        "notes": info.get("description", ""),
-        "cover_url": cover_url,
-    })
-
-
-def lookup_online_metadata(existing: dict) -> tuple[dict, str]:
-    isbn = re.sub(r"[^0-9Xx]", "", existing.get("isbn", ""))
-    title = existing.get("title", "").strip()
-    author = existing.get("author", "").strip()
-
-    queries = []
-    if isbn:
-        queries.append(("openlibrary", f"https://openlibrary.org/search.json?isbn={urllib.parse.quote(isbn)}&limit=1"))
-        queries.append(("google", f"https://www.googleapis.com/books/v1/volumes?q=isbn:{urllib.parse.quote(isbn)}&maxResults=1"))
-    if title:
-        open_query = f"title:{title}"
-        google_query = f"intitle:{title}"
-        if author:
-            open_query += f" author:{author}"
-            google_query += f"+inauthor:{author}"
-        queries.append(("openlibrary", "https://openlibrary.org/search.json?" + urllib.parse.urlencode({"q": open_query, "limit": "1"})))
-        queries.append(("google", "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode({"q": google_query, "maxResults": "1"})))
-
-    last_error = ""
-    for service, url in queries:
-        try:
-            data = fetch_json(url)
-            if service == "openlibrary":
-                docs = data.get("docs") or []
-                if docs:
-                    return metadata_from_open_library_doc(docs[0]), "Open Library"
-            else:
-                items = data.get("items") or []
-                if items:
-                    return metadata_from_google_volume(items[0]), "Google Books"
-        except Exception as exc:
-            last_error = str(exc)
-            continue
-
-    if last_error:
-        raise RuntimeError(last_error)
-    return {}, ""
-
-
-def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
+def detect_metadata_from_text(path: Path, existing: dict | None = None, max_chars: int = 50000) -> dict:
     """Best-effort local metadata detector.
 
     This is not a true AI model. It uses EPUB metadata, file names, and common
@@ -1496,6 +1571,8 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
     result = {
         "title": existing.get("title", ""),
         "author": existing.get("author", ""),
+        "series": existing.get("series", ""),
+        "series_number": existing.get("series_number", ""),
         "source": existing.get("source", ""),
         "tags": existing.get("tags", ""),
         "notes": existing.get("notes", ""),
@@ -1512,7 +1589,7 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
                 result[key] = epub_metadata[key]
 
     prefer_filename_title = path.suffix.lower() in {".pdf", ".docx", ".doc"}
-    text = read_text_for_metadata_detection(path)
+    text = read_text_for_metadata_detection(path, max_chars=max_chars)
     lines = [clean_metadata_line(line) for line in re.split(r"[\r\n]+", text)]
     lines = [
         line for line in lines
@@ -1637,6 +1714,8 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
                     result["publisher"] = cleaned_publisher
                     break
 
+    result["series"], result["series_number"] = detect_series_fields(lines, result)
+
     if text and not result.get("edition"):
         edition_value = line_after_label(lines, ["edition"], max_index=220)
         if edition_value and "edition" in edition_value.lower():
@@ -1653,6 +1732,9 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
                 result["edition"] = clean_metadata_line(match.group(1))
                 break
 
+    if not result["author"]:
+        result["author"] = catalog_author(text)
+
     # Source guess.
     combined = (str(path) + " " + text[:1000]).lower()
     if not result["source"]:
@@ -1660,33 +1742,31 @@ def detect_metadata_from_text(path: Path, existing: dict | None = None) -> dict:
             result["source"] = "Bookshare"
         elif "kindle" in combined or path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS:
             result["source"] = "Kindle"
-        else:
-            result["source"] = "Personal"
 
-    # Tags guess.
+    # Only propose supported subject categories, never format or source tags.
     if not result["tags"]:
         tags = []
         keyword_value = line_after_label(lines, ["keywords", "subjects", "subject"], max_index=120)
         if keyword_value:
             tags.extend([part.strip() for part in re.split(r"[,;]", keyword_value) if part.strip()])
-        if "bookshare" in combined:
-            tags.append("Bookshare")
-        if path.suffix.lower() == ".epub":
-            tags.append("EPUB")
-        elif path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS:
-            tags.append("Kindle")
-        elif path.suffix.lower() == ".docx":
-            tags.append("DOCX")
-        elif path.suffix.lower() == ".pdf":
-            tags.append("PDF")
         deduped_tags = []
         for tag in tags:
             if tag and tag.lower() not in [existing_tag.lower() for existing_tag in deduped_tags]:
                 deduped_tags.append(tag)
         result["tags"] = ", ".join(deduped_tags)
 
+    result["tags"] = existing.get("tags") or normalize_import_tags(result["tags"])
+
     # Do not auto-fill notes. Notes remain available for manual editing only.
     return result
+
+
+def catalog_author(text):
+    # Cataloging statements identify responsibility after a slash and before
+    # the physical-description marker, even when PDF paragraphs are flattened.
+    match = re.search(r"\s/\s+([^/\r\n]{3,100}?)\.\s+p\.\s*cm\b", text[:50000], re.IGNORECASE)
+    candidate = clean_author_value(match.group(1)) if match else ""
+    return candidate if looks_like_author(candidate) else ""
 
 
 def detect_metadata_from_text_content(text: str, existing: dict | None = None) -> dict:
@@ -1694,6 +1774,8 @@ def detect_metadata_from_text_content(text: str, existing: dict | None = None) -
     result = {
         "title": existing.get("title", ""),
         "author": existing.get("author", ""),
+        "series": existing.get("series", ""),
+        "series_number": existing.get("series_number", ""),
         "source": existing.get("source", ""),
         "tags": existing.get("tags", ""),
         "notes": existing.get("notes", ""),
@@ -1732,6 +1814,9 @@ def detect_metadata_from_text_content(text: str, existing: dict | None = None) -
                     result["author"] = cleaned_author
                     break
 
+    if not result["author"]:
+        result["author"] = catalog_author(text or "")
+
     if not result["title"]:
         for line in lines[:100]:
             lower = line.lower()
@@ -1761,6 +1846,8 @@ def detect_metadata_from_text_content(text: str, existing: dict | None = None) -
         if not result.get("publisher"):
             result["publisher"] = extract_publisher_from_text(text)
 
+    result["series"], result["series_number"] = detect_series_fields(lines, result)
+
     if text and not result.get("edition"):
         edition_value = line_after_label(lines, ["edition"], max_index=220)
         if edition_value:
@@ -1774,7 +1861,7 @@ def detect_metadata_from_text_content(text: str, existing: dict | None = None) -
                 break
 
     if not result["source"]:
-        result["source"] = "Bookshare" if "bookshare" in (text or "").lower() else "Personal"
+        result["source"] = "Bookshare" if "bookshare" in (text or "").lower() else ""
 
     return result
 
@@ -2035,7 +2122,7 @@ class AccessibleSingleFieldDialog:
         return dialog.result
 
 
-def ask_metadata_with_windows_forms(heading, fields, initial, initial_focus_key="title"):
+def ask_metadata_with_windows_forms(heading, fields, initial, initial_focus_key="title", require_title=True):
     if not sys.platform.startswith("win") or not shutil.which("powershell"):
         return None
 
@@ -2044,6 +2131,7 @@ def ask_metadata_with_windows_forms(heading, fields, initial, initial_focus_key=
         "fields": [{"key": key, "label": label, "hint": hint} for key, label, hint in fields],
         "values": {key: str(initial.get(key, "") or "") for key, _label, _hint in fields},
         "initialFocusKey": initial_focus_key or "title",
+        "requireTitle": bool(require_title),
     }
 
     script = r'''
@@ -2145,7 +2233,7 @@ $noEditionButton.Add_Click({
 
 $saveButton.Add_Click({
     $titleBox = $textBoxes["title"]
-    if ($null -eq $titleBox -or [string]::IsNullOrWhiteSpace($titleBox.Text)) {
+    if ($payload.requireTitle -and ($null -eq $titleBox -or [string]::IsNullOrWhiteSpace($titleBox.Text))) {
         [System.Windows.Forms.MessageBox]::Show("Title is required.", "Missing title", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         if ($null -ne $titleBox) {
             $titleBox.Focus() | Out-Null
@@ -2230,6 +2318,8 @@ class AccessibleMetadataFormDialog:
     FIELDS = [
         ("title", "Title", "Required."),
         ("author", "Author", ""),
+        ("series", "Series", "Series or collection name."),
+        ("series_number", "Series number", "For example 1, 2, 3, or 2.5."),
         ("edition", "Edition", "For example third edition, revised edition, or No edition."),
         ("year", "Year", "Publication year."),
         ("isbn", "ISBN", ""),
@@ -2405,6 +2495,38 @@ class TkMetadataDialog:
         return AccessibleMetadataFormDialog.ask(parent, heading, initial, initial_focus_key=initial_focus_key)
 
 
+class BulkMetadataDialog:
+    FIELDS = [
+        ("author", "Author", "Leave blank to keep each book's current author."),
+        ("series", "Series", "Leave blank to keep each book's current series."),
+        ("edition", "Edition", "Leave blank to keep each book's current edition."),
+        ("year", "Year", "Leave blank to keep each book's current publication year."),
+        ("publisher", "Publisher", "Leave blank to keep each book's current publisher."),
+        ("source", "Source", "Leave blank to keep each book's current source."),
+        ("tags", "Tags", "Leave blank to keep each book's current tags."),
+        ("notes", "Notes", "Leave blank to keep each book's current notes."),
+    ]
+
+    @staticmethod
+    def ask(parent):
+        if sys.platform.startswith("win") and shutil.which("powershell"):
+            try:
+                return ask_metadata_with_windows_forms(
+                    "Bulk Edit Metadata",
+                    BulkMetadataDialog.FIELDS,
+                    {},
+                    initial_focus_key="author",
+                    require_title=False,
+                )
+            except Exception:
+                pass
+        messagebox.showerror(
+            "Bulk editor unavailable",
+            "The accessible bulk metadata editor requires Windows PowerShell forms."
+        )
+        return None
+
+
 class LibraryApp:
     def __init__(self, root):
         self.root = root
@@ -2418,21 +2540,37 @@ class LibraryApp:
         self.shortcut_readout_var = StringVar()
         self.book_list_ids = []
         self.book_list_titles = []
+        self.book_list_announcement_texts = []
+        self.multi_book_lists = []
+        self.multi_book_list_frames = []
+        self.multi_book_list_index_maps = []
+        self.temporary_column_announcement_item = None
+        self.active_multi_book_column = 0
         self.marked_book_ids = set()
         self.last_missing_metadata_sound_book_id = None
         self.nvda_controller = None
         self.nvda_controller_checked = False
         self.last_nvda_announcement = ""
+        self.suppress_next_book_list_select_announcement = False
         self.last_alt_number_key = ""
         self.last_alt_number_time = 0.0
         self.shortcut_readout_return_after = None
+        self.cover_image_cache = {}
+        self.cover_preview_photo = None
+        self.cover_preview_book_id = None
+        self.cover_preview_after = None
         self.sort_by = "title"
         self.filter_source = ""
         self.filter_tag = ""
         self.filter_format = ""
+        self.active_saved_view = ""
         self.backup_check_after = None
         self.watched_scan_after = None
+        self.duplicate_cleanup_after = None
         self.watched_scan_running = False
+        self.watched_scan_queue = queue.Queue()
+        self.folder_import_running = False
+        self.folder_discovery_running = False
         self._index_queue = queue.Queue()
         self._start_content_indexer()
 
@@ -2441,6 +2579,7 @@ class LibraryApp:
         self.refresh_books()
         self.schedule_backup_check(5000)
         self.schedule_watched_folder_scan(15000)
+        self.schedule_automatic_duplicate_cleanup(10000)
         self.root.after(750, self.import_command_line_files)
 
     def build_menu(self):
@@ -2464,12 +2603,18 @@ class LibraryApp:
 
         book_menu = Menu(menu_bar, tearoff=False)
         book_menu.add_command(label="Edit Metadata...\tF2", command=self.edit_book)
+        book_menu.add_command(label="Bulk Edit Selected Metadata...", command=self.bulk_edit_selected_metadata)
         book_menu.add_command(label="Auto-Detect Metadata...\tCtrl+D", command=self.auto_detect_selected_metadata)
         repair_menu = Menu(book_menu, tearoff=False)
+        repair_menu.add_command(label="Cleanup and Repair Wizard...", command=self.cleanup_repair_wizard)
+        repair_menu.add_separator()
         repair_menu.add_command(label="Check EPUB Accessibility Metadata...", command=self.check_selected_epub_accessibility)
         repair_menu.add_command(label="Add EPUB Page Breaks from Page Labels...", command=self.add_page_breaks_to_selected_epub)
         repair_menu.add_command(label="Rebuild EPUB Table of Contents from Text TOC...", command=self.rebuild_selected_epub_toc_from_text)
         repair_menu.add_command(label="Clean Repaired EPUB Text...", command=self.clean_selected_epub_text)
+        repair_menu.add_command(label="Combine Selected Books into One EPUB...", command=self.combine_selected_books_to_epub)
+        repair_menu.add_separator()
+        repair_menu.add_command(label="Remove Repair Backup Files...", command=self.remove_repair_backup_files)
         book_menu.add_cascade(label="Repair", menu=repair_menu)
         book_menu.add_command(label="Look Up Metadata Online...", command=self.lookup_selected_metadata_online)
         book_menu.add_command(label="View Cover Image...", command=self.view_selected_cover_image)
@@ -2489,6 +2634,9 @@ class LibraryApp:
         sort_menu.add_command(label="Author A to Z", command=lambda: self.set_sort("author"))
         sort_menu.add_command(label="Author Z to A", command=lambda: self.set_sort("author_desc"))
         sort_menu.add_separator()
+        sort_menu.add_command(label="Series A to Z", command=lambda: self.set_sort("series"))
+        sort_menu.add_command(label="Series Z to A", command=lambda: self.set_sort("series_desc"))
+        sort_menu.add_separator()
         sort_menu.add_command(label="Published Year Newest to Oldest", command=lambda: self.set_sort("date"))
         sort_menu.add_command(label="Published Year Oldest to Newest", command=lambda: self.set_sort("date_oldest"))
         sort_menu.add_separator()
@@ -2503,7 +2651,19 @@ class LibraryApp:
         filter_menu.add_command(label="Clear Filters", command=self.clear_filters)
         organize_menu.add_cascade(label="Filter", menu=filter_menu)
         organize_menu.add_separator()
+        saved_views_menu = Menu(organize_menu, tearoff=False)
+        saved_views_menu.add_command(label="Missing Metadata", command=lambda: self.apply_builtin_saved_view("missing_metadata"))
+        saved_views_menu.add_command(label="Recently Added", command=lambda: self.apply_builtin_saved_view("recently_added"))
+        saved_views_menu.add_command(label="EPUB Books", command=lambda: self.apply_builtin_saved_view("epub"))
+        saved_views_menu.add_command(label="Bookshare Books", command=lambda: self.apply_builtin_saved_view("bookshare"))
+        saved_views_menu.add_separator()
+        saved_views_menu.add_command(label="Save Current View...", command=self.save_current_view)
+        saved_views_menu.add_command(label="Choose Saved View...", command=self.choose_saved_view)
+        saved_views_menu.add_command(label="Clear Saved View", command=self.clear_saved_view)
+        organize_menu.add_cascade(label="Saved Views", menu=saved_views_menu)
+        organize_menu.add_separator()
         organize_menu.add_command(label="Remove Duplicate Books, Prefer EPUB...", command=self.remove_duplicates_prefer_epub)
+        organize_menu.add_command(label="Toggle Automatic Duplicate Cleanup", command=self.toggle_automatic_duplicate_cleanup)
         organize_menu.add_command(label="Show Sort and Filter Settings", command=self.show_organize_settings)
         menu_bar.add_cascade(label="Organize", menu=organize_menu, underline=0)
 
@@ -2525,11 +2685,17 @@ class LibraryApp:
         speech_menu.add_command(label="Show Current Book List Reading", command=self.show_book_list_speech_fields)
         settings_menu.add_cascade(label="Book List Reading", menu=speech_menu)
         settings_menu.add_separator()
+        display_menu = Menu(settings_menu, tearoff=False)
+        display_menu.add_command(label="Single List", command=lambda: self.set_book_list_display_mode("single"))
+        display_menu.add_command(label="Multiple Alphabetical Lists", command=lambda: self.set_book_list_display_mode("multiple"))
+        display_menu.add_separator()
+        display_menu.add_command(label="Show Current Display", command=self.show_book_list_display_mode)
+        settings_menu.add_cascade(label="Book List Display", menu=display_menu)
+        settings_menu.add_separator()
         missing_metadata_menu = Menu(settings_menu, tearoff=False)
         missing_metadata_menu.add_command(label="Off", command=lambda: self.set_missing_metadata_sound_mode("off"))
-        missing_metadata_menu.add_command(label="Missing Author Only", command=lambda: self.set_missing_metadata_sound_mode("author"))
-        missing_metadata_menu.add_command(label="Missing Author, Edition, or Year", command=lambda: self.set_missing_metadata_sound_mode("useful"))
-        missing_metadata_menu.add_command(label="Missing Author, Edition, Year, ISBN, or Publisher", command=lambda: self.set_missing_metadata_sound_mode("complete"))
+        for mode, (label, _fields) in MISSING_METADATA_SOUND_MODES.items():
+            missing_metadata_menu.add_command(label=label, command=lambda mode=mode: self.set_missing_metadata_sound_mode(mode))
         missing_metadata_menu.add_separator()
         missing_metadata_menu.add_command(label="Show Current Setting", command=self.show_missing_metadata_sound_mode)
         missing_metadata_menu.add_command(label="Test Sound", command=self.test_missing_metadata_sound)
@@ -2609,37 +2775,61 @@ class LibraryApp:
             text="Books list. Use Settings to choose which details are read while navigating."
         ).pack(anchor="w")
 
-        self.book_list = Listbox(list_frame, selectmode="browse", height=20, exportselection=False, takefocus=1)
-        scrollbar = Scrollbar(list_frame, orient="vertical", command=self.book_list.yview)
+        cover_frame = ttk.Frame(list_frame, padding=(12, 0, 0, 0))
+        cover_frame.pack(side=RIGHT, fill=Y)
+        ttk.Label(cover_frame, text="Cover preview").pack(anchor="w")
+        self.cover_preview_label = ttk.Label(
+            cover_frame,
+            text="No cover",
+            anchor="center",
+            relief="solid",
+            width=22,
+        )
+        self.cover_preview_label.pack(fill=X, pady=(4, 6), ipady=48)
+        self.cover_preview_title_var = StringVar(value="")
+        ttk.Label(
+            cover_frame,
+            textvariable=self.cover_preview_title_var,
+            wraplength=170,
+            justify="center",
+        ).pack(fill=X)
+        ttk.Button(cover_frame, text="View Cover", command=self.view_selected_cover_image).pack(fill=X, pady=(8, 0))
+        ttk.Button(cover_frame, text="Find Cover", command=self.find_cover_for_selected_book).pack(fill=X, pady=(4, 0))
+
+        self.book_display_area = ttk.Frame(list_frame)
+        self.book_display_area.pack(side=LEFT, fill=BOTH, expand=True)
+
+        self.single_book_list_frame = ttk.Frame(self.book_display_area)
+        self.multi_book_list_frame = ttk.Frame(self.book_display_area)
+
+        self.book_list = Listbox(self.single_book_list_frame, selectmode="browse", height=20, exportselection=False, takefocus=1)
+        scrollbar = Scrollbar(self.single_book_list_frame, orient="vertical", command=self.book_list.yview)
         self.book_list.configure(yscrollcommand=scrollbar.set)
-
         self.book_list.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill=Y)
+        scrollbar.pack(side=LEFT, fill=Y)
+        self.bind_book_list_widget(self.book_list)
 
-        self.book_list.bind("<Return>", lambda event: self.open_book())
-        self.book_list.bind("<Alt-Return>", lambda event: self.open_book())
-        self.book_list.bind("<Delete>", lambda event: self.delete_book())
-        self.book_list.bind("<F2>", lambda event: self.edit_book())
-        self.book_list.bind("<Control-e>", lambda event: self.export_book())
-        self.book_list.bind("<Control-V>", lambda event: self.send_to_voice_dream())
-        self.book_list.bind("<Control-o>", lambda event: self.open_book())
-        self.book_list.bind("<Control-k>", lambda event: self.open_kindle())
-        self.book_list.bind("<Control-r>", lambda event: self.convert_selected_to_epub())
-        self.book_list.bind("<Control-K>", lambda event: self.send_to_kindle())
-        self.book_list.bind("<Control-E>", lambda event: self.send_to_nls_ereader())
-        self.book_list.bind("<Control-n>", lambda event: self.add_book())
-        self.book_list.bind("<Control-f>", self.focus_search_from_keyboard)
-        self.book_list.bind("<Control-i>", lambda event: self.show_selected_book_info())
-        self.book_list.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
-        self.book_list.bind("<Control-a>", self.select_all_books)
-        self.book_list.bind("<Control-A>", lambda event: self.deselect_all_books())
-        self.book_list.bind("<Control-space>", self.toggle_mark_current_book)
-        self.book_list.bind("<Escape>", self.clear_search_from_keyboard)
-        self.book_list.bind("<Home>", self.move_to_first_book)
-        self.book_list.bind("<End>", self.move_to_last_book)
-        self.bind_alt_number_shortcuts(self.book_list)
-        self.book_list.bind("<<ListboxSelect>>", self.on_book_list_select)
-        self.book_list.bind("<KeyPress>", self.on_book_list_keypress)
+        for group_label, _letters in BOOK_LIST_ALPHABET_GROUPS:
+            column = ttk.Frame(self.multi_book_list_frame, padding=(0, 0, 8, 0))
+            ttk.Label(column, text=group_label).pack(anchor="w")
+            listbox = Listbox(
+                column,
+                selectmode="browse",
+                height=20,
+                exportselection=False,
+                takefocus=1,
+                name=f"{group_label.lower().replace('-', '_')}_book_list",
+            )
+            column_scrollbar = Scrollbar(column, orient="vertical", command=listbox.yview)
+            listbox.configure(yscrollcommand=column_scrollbar.set)
+            listbox.pack(side=LEFT, fill=BOTH, expand=True)
+            column_scrollbar.pack(side=LEFT, fill=Y)
+            self.bind_book_list_widget(listbox, multiple_column=True)
+            self.multi_book_list_frames.append(column)
+            self.multi_book_lists.append(listbox)
+            self.multi_book_list_index_maps.append([])
+
+        self.apply_book_list_display_mode(initial=True)
 
         self.root.bind("<Control-n>", lambda event: self.add_book())
         self.root.bind("<Control-N>", lambda event: self.import_folder())
@@ -2674,15 +2864,105 @@ class LibraryApp:
         self.shortcut_readout.bind("<Home>", self.return_to_book_list_from_readout)
         self.shortcut_readout.bind("<End>", self.return_to_book_list_from_readout)
         self.shortcut_readout.bind("<Escape>", self.return_to_book_list_from_readout)
-
         status = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
         status.pack(fill=X, pady=(8, 0))
 
-        self.book_list.focus_set()
+        self.focus_books_list()
+
+    def bind_book_list_widget(self, widget, multiple_column=False):
+        widget.bind("<Return>", lambda event: self.open_book())
+        widget.bind("<Alt-Return>", lambda event: self.open_book())
+        widget.bind("<Delete>", lambda event: self.delete_book())
+        widget.bind("<F2>", lambda event: self.edit_book())
+        widget.bind("<Control-e>", lambda event: self.export_book())
+        widget.bind("<Control-V>", lambda event: self.send_to_voice_dream())
+        widget.bind("<Control-o>", lambda event: self.open_book())
+        widget.bind("<Control-k>", lambda event: self.open_kindle())
+        widget.bind("<Control-r>", lambda event: self.convert_selected_to_epub())
+        widget.bind("<Control-K>", lambda event: self.send_to_kindle())
+        widget.bind("<Control-E>", lambda event: self.send_to_nls_ereader())
+        widget.bind("<Control-n>", lambda event: self.add_book())
+        widget.bind("<Control-f>", self.focus_search_from_keyboard)
+        widget.bind("<Control-i>", lambda event: self.show_selected_book_info())
+        widget.bind("<Control-d>", lambda event: self.auto_detect_selected_metadata())
+        widget.bind("<Control-a>", self.select_all_books)
+        widget.bind("<Control-A>", lambda event: self.deselect_all_books())
+        widget.bind("<Control-space>", self.toggle_mark_current_book)
+        widget.bind("<Escape>", self.clear_search_from_keyboard)
+        widget.bind("<Home>", self.move_to_first_book)
+        widget.bind("<End>", self.move_to_last_book)
+        if multiple_column:
+            widget.bind("<Left>", lambda event: self.move_between_book_columns(event, -1))
+            widget.bind("<Right>", lambda event: self.move_between_book_columns(event, 1))
+        self.bind_alt_number_shortcuts(widget)
+        widget.bind("<<ListboxSelect>>", self.on_book_list_select)
+        widget.bind("<KeyPress>", self.on_book_list_keypress)
 
     def bind_alt_number_shortcuts(self, widget):
         for digit in "1234567890":
             widget.bind(f"<Alt-KeyPress-{digit}>", self.on_book_list_alt_number)
+
+    def get_book_list_display_mode(self):
+        mode = self.db.get_setting("book_list_display_mode", DEFAULT_BOOK_LIST_DISPLAY_MODE)
+        if mode not in BOOK_LIST_DISPLAY_MODES:
+            return DEFAULT_BOOK_LIST_DISPLAY_MODE
+        return mode
+
+    def book_list_display_mode_label(self):
+        return BOOK_LIST_DISPLAY_MODES[self.get_book_list_display_mode()]
+
+    def set_book_list_display_mode(self, mode):
+        if mode not in BOOK_LIST_DISPLAY_MODES:
+            mode = DEFAULT_BOOK_LIST_DISPLAY_MODE
+        current_book_id = self.selected_book_id_quiet()
+        self.db.set_setting("book_list_display_mode", mode)
+        self.apply_book_list_display_mode()
+        self.refresh_books(selected_book_id=current_book_id)
+        self.status_var.set(f"Book list display set to {BOOK_LIST_DISPLAY_MODES[mode]}.")
+
+    def show_book_list_display_mode(self):
+        messagebox.showinfo(
+            "Current Book List Display",
+            f"The book list is currently shown as:\n\n{self.book_list_display_mode_label()}"
+        )
+
+    def apply_book_list_display_mode(self, initial=False):
+        if not hasattr(self, "single_book_list_frame") or not hasattr(self, "multi_book_list_frame"):
+            return
+        self.single_book_list_frame.pack_forget()
+        self.multi_book_list_frame.pack_forget()
+        if self.get_book_list_display_mode() == "multiple":
+            self.multi_book_list_frame.pack(fill=BOTH, expand=True)
+            self.show_active_multi_book_column()
+        else:
+            self.single_book_list_frame.pack(fill=BOTH, expand=True)
+        if not initial:
+            self.focus_books_list()
+
+    def is_multiple_book_list_mode(self):
+        return self.get_book_list_display_mode() == "multiple"
+
+    def show_active_multi_book_column(self):
+        if not hasattr(self, "multi_book_list_frames"):
+            return
+        for frame in self.multi_book_list_frames:
+            frame.pack_forget()
+        if not self.multi_book_list_frames:
+            return
+        if (
+            self.multi_book_lists
+            and 0 <= self.active_multi_book_column < len(self.multi_book_lists)
+            and self.multi_book_lists[self.active_multi_book_column].size() == 0
+        ):
+            for index, listbox in enumerate(self.multi_book_lists):
+                if listbox.size() > 0:
+                    self.active_multi_book_column = index
+                    break
+        self.active_multi_book_column = max(
+            0,
+            min(self.active_multi_book_column, len(self.multi_book_list_frames) - 1),
+        )
+        self.multi_book_list_frames[self.active_multi_book_column].pack(fill=BOTH, expand=True)
 
     def sort_label(self):
         labels = {
@@ -2690,6 +2970,8 @@ class LibraryApp:
             "title_desc": "Title Z to A",
             "author": "Author A to Z",
             "author_desc": "Author Z to A",
+            "series": "Series A to Z",
+            "series_desc": "Series Z to A",
             "date": "Published Year Newest to Oldest",
             "date_oldest": "Published Year Oldest to Newest",
             "date_added": "Date Added Newest to Oldest",
@@ -2705,6 +2987,8 @@ class LibraryApp:
             parts.append(f"tag contains {self.filter_tag}")
         if self.filter_format:
             parts.append(f"format contains {self.filter_format}")
+        if self.active_saved_view:
+            parts.append(f"saved view {self.saved_view_label(self.active_saved_view)}")
         if not parts:
             return "No filters"
         return "; ".join(parts)
@@ -2761,9 +3045,124 @@ class LibraryApp:
         self.filter_source = ""
         self.filter_tag = ""
         self.filter_format = ""
+        self.active_saved_view = ""
         self.refresh_books()
         self.focus_books_list()
         self.status_var.set("Filters cleared.")
+
+    def saved_views(self):
+        raw = self.db.get_setting("saved_views", "{}")
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_saved_views(self, views):
+        self.db.set_setting("saved_views", json.dumps(views, sort_keys=True))
+
+    def apply_builtin_saved_view(self, view_name):
+        self.active_saved_view = view_name
+        if view_name == "recently_added":
+            self.sort_by = "date_added"
+            self.filter_source = ""
+            self.filter_tag = ""
+            self.filter_format = ""
+            self.search_var.set("")
+        elif view_name == "epub":
+            self.filter_format = "epub"
+            self.filter_source = ""
+            self.filter_tag = ""
+            self.search_var.set("")
+        elif view_name == "bookshare":
+            self.filter_source = "Bookshare"
+            self.filter_tag = ""
+            self.filter_format = ""
+            self.search_var.set("")
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set(f"Saved view applied: {self.saved_view_label(view_name)}.")
+
+    def saved_view_label(self, view_name):
+        labels = {
+            "missing_metadata": "Missing Metadata",
+            "recently_added": "Recently Added",
+            "epub": "EPUB Books",
+            "bookshare": "Bookshare Books",
+        }
+        return labels.get(view_name, view_name)
+
+    def save_current_view(self):
+        name = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "View name",
+            "Type a short name for this saved view.",
+            "",
+            heading="Save Current View",
+        )
+        if not name:
+            return
+        views = self.saved_views()
+        views[name] = {
+            "query": self.search_var.get(),
+            "sort_by": self.sort_by,
+            "source": self.filter_source,
+            "tag": self.filter_tag,
+            "format": self.filter_format,
+            "view": self.active_saved_view,
+        }
+        self.set_saved_views(views)
+        self.status_var.set(f"Saved view {name}.")
+        messagebox.showinfo("Saved View", f"Saved view:\n\n{name}")
+
+    def choose_saved_view(self):
+        views = self.saved_views()
+        if not views:
+            messagebox.showinfo("No Saved Views", "No custom saved views have been saved yet.")
+            return
+        names = sorted(views)
+        prompt = "\n".join(f"{index + 1}. {name}" for index, name in enumerate(names))
+        choice = AccessibleSingleFieldDialog.ask(
+            self.root,
+            "Saved view number",
+            "Type the number of the saved view to open.\n\n" + prompt,
+            "",
+            heading="Choose Saved View",
+        )
+        if not choice:
+            return
+        try:
+            selected = names[int(choice) - 1]
+        except Exception:
+            messagebox.showerror("Invalid choice", "Please enter a valid saved view number.")
+            return
+        view = views[selected]
+        self.search_var.set(view.get("query", ""))
+        self.sort_by = view.get("sort_by", "title")
+        self.filter_source = view.get("source", "")
+        self.filter_tag = view.get("tag", "")
+        self.filter_format = view.get("format", "")
+        self.active_saved_view = view.get("view", "")
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set(f"Saved view applied: {selected}.")
+
+    def clear_saved_view(self):
+        self.active_saved_view = ""
+        self.refresh_books()
+        self.focus_books_list()
+        self.status_var.set("Saved view cleared.")
+
+    def row_missing_metadata_for_view(self, row):
+        values = {
+            "tags": row[4],
+            "author": row[2],
+            "edition": row[7] if len(row) > 7 else "",
+            "year": row[8] if len(row) > 8 else "",
+            "isbn": row[9] if len(row) > 9 else "",
+            "publisher": row[10] if len(row) > 10 else "",
+        }
+        return any(not (value or "").strip() for value in values.values())
 
     def show_organize_settings(self):
         messagebox.showinfo(
@@ -2783,6 +3182,26 @@ class LibraryApp:
             return ("title_author", title_key, author_key)
         return None
 
+    def duplicate_rows_match(self, left, right):
+        left_isbn = normalize_isbn_key(left[12] or "")
+        right_isbn = normalize_isbn_key(right[12] or "")
+        if left_isbn and right_isbn:
+            return left_isbn == right_isbn
+        if left_isbn or right_isbn:
+            # One copy may have a detected ISBN while an older duplicate does not.
+            pass
+
+        left_title = left[1] or ""
+        right_title = right[1] or ""
+        if not title_keys_look_same(left_title, right_title, allow_richer_metadata_match=True):
+            return False
+
+        left_author = normalize_duplicate_key(left[2] or "")
+        right_author = normalize_duplicate_key(right[2] or "")
+        if left_author and right_author and left_author != right_author:
+            return False
+        return True
+
     def duplicate_keep_sort_key(self, row):
         book_format = (row[6] or "").casefold()
         stored_path = str(row[8] or "")
@@ -2798,18 +3217,36 @@ class LibraryApp:
             row[0],
         )
 
-    def duplicate_groups(self):
-        grouped = {}
-        for row in self.db.all_books_for_duplicate_check():
-            key = self.duplicate_group_key(row)
-            if key is None:
-                continue
-            grouped.setdefault(key, []).append(row)
-        return [rows for rows in grouped.values() if len(rows) > 1]
+    def duplicate_groups(self, database=None):
+        database = database or self.db
+        rows = list(database.all_books_for_duplicate_check())
+        parent = {row[0]: row[0] for row in rows}
 
-    def duplicate_removal_plan(self):
+        def find(book_id):
+            while parent[book_id] != book_id:
+                parent[book_id] = parent[parent[book_id]]
+                book_id = parent[book_id]
+            return book_id
+
+        def union(left_id, right_id):
+            left_root = find(left_id)
+            right_root = find(right_id)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for index, left in enumerate(rows):
+            for right in rows[index + 1:]:
+                if self.duplicate_rows_match(left, right):
+                    union(left[0], right[0])
+
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(find(row[0]), []).append(row)
+        return [group for group in grouped.values() if len(group) > 1]
+
+    def duplicate_removal_plan(self, database=None):
         plan = []
-        for rows in self.duplicate_groups():
+        for rows in self.duplicate_groups(database):
             ranked = sorted(rows, key=self.duplicate_keep_sort_key)
             keep = ranked[0]
             remove = ranked[1:]
@@ -2839,7 +3276,7 @@ class LibraryApp:
         if not plan:
             messagebox.showinfo(
                 "No duplicates found",
-                "No duplicate books were found using title plus author, or ISBN when available."
+                "No duplicate books were found using ISBN, title, and compatible author information."
             )
             self.status_var.set("No duplicates found.")
             return
@@ -2881,6 +3318,90 @@ class LibraryApp:
                 f"Removed {removed} duplicate book{'s' if removed != 1 else ''}."
             )
         self.status_var.set(f"Removed {removed} duplicate book{'s' if removed != 1 else ''}.")
+
+    def automatic_duplicate_cleanup_enabled(self):
+        return self.db.get_setting(
+            "automatic_duplicate_cleanup",
+            DEFAULT_AUTOMATIC_DUPLICATE_CLEANUP,
+        ) == "1"
+
+    def toggle_automatic_duplicate_cleanup(self):
+        enabled = not self.automatic_duplicate_cleanup_enabled()
+        if enabled and not messagebox.askyesno(
+            "Enable Automatic Duplicate Cleanup",
+            "Automatic cleanup removes likely duplicate entries from the library list without asking each time. "
+            "It keeps the book files, but a mistaken match can hide a different book from the list.\n\nEnable it?",
+        ):
+            return
+        self.db.set_setting("automatic_duplicate_cleanup", "1" if enabled else "0")
+        state = "on" if enabled else "off"
+        self.status_var.set(f"Automatic duplicate cleanup turned {state}.")
+        messagebox.showinfo(
+            "Automatic Duplicate Cleanup",
+            f"Automatic duplicate cleanup is now {state}.\n\n"
+            "When on, the app removes duplicate entries from the library list on startup and periodically. "
+            "It does not delete book files from disk."
+        )
+        self.schedule_automatic_duplicate_cleanup(1000 if enabled else None)
+
+    def schedule_automatic_duplicate_cleanup(self, delay_ms=None):
+        if self.duplicate_cleanup_after is not None:
+            try:
+                self.root.after_cancel(self.duplicate_cleanup_after)
+            except Exception:
+                pass
+            self.duplicate_cleanup_after = None
+        if not self.automatic_duplicate_cleanup_enabled():
+            return
+        delay_ms = AUTOMATIC_DUPLICATE_CLEANUP_INTERVAL_MS if delay_ms is None else delay_ms
+        self.duplicate_cleanup_after = self.root.after(delay_ms, self.automatic_duplicate_cleanup)
+
+    def automatic_duplicate_cleanup(self):
+        self.duplicate_cleanup_after = None
+        if not self.automatic_duplicate_cleanup_enabled():
+            return
+        events = queue.Queue()
+
+        def worker():
+            database = None
+            try:
+                database = LibraryDatabase()
+                plan = self.duplicate_removal_plan(database)
+                ids = [row[0] for _keep, remove_rows in plan for row in remove_rows]
+                if ids:
+                    database.connection.executemany(
+                        "DELETE FROM books_fts WHERE rowid = ?", ((book_id,) for book_id in ids)
+                    )
+                    database.connection.executemany(
+                        "DELETE FROM books WHERE id = ?", ((book_id,) for book_id in ids)
+                    )
+                    database.connection.commit()
+                events.put((len(ids), ""))
+            except Exception as exc:
+                logger.exception("Automatic duplicate cleanup failed")
+                events.put((0, str(exc)))
+            finally:
+                if database is not None:
+                    database.close()
+
+        def poll():
+            try:
+                removed, error = events.get_nowait()
+            except queue.Empty:
+                self.root.after(100, poll)
+                return
+            if error:
+                self.log_error("Automatic duplicate cleanup", RuntimeError(error))
+                self.status_var.set("Automatic duplicate cleanup failed.")
+            elif removed:
+                self.refresh_books()
+                self.status_var.set(
+                    f"Automatic duplicate cleanup removed {removed} duplicate book entr{'y' if removed == 1 else 'ies'}."
+                )
+            self.schedule_automatic_duplicate_cleanup()
+
+        threading.Thread(target=worker, daemon=True, name="duplicate-cleanup").start()
+        self.root.after(100, poll)
 
     def get_book_list_speech_fields(self):
         raw = self.db.get_setting(
@@ -2990,16 +3511,12 @@ class LibraryApp:
     def play_missing_metadata_sound(self):
         if not sys.platform.startswith("win"):
             return
-        try:
-            winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
-        except Exception:
+        def play():
             try:
-                winsound.MessageBeep()
+                winsound.Beep(880, 70)
             except Exception:
-                try:
-                    winsound.Beep(880, 70)
-                except Exception:
-                    pass
+                pass
+        threading.Thread(target=play, daemon=True).start()
 
     def nvda_book_list_announcements_enabled(self):
         controller = self.get_nvda_controller()
@@ -3052,7 +3569,7 @@ class LibraryApp:
         try:
             if controller.nvdaController_testIfRunning() != 0:
                 return
-            text = self.book_list.get(index)
+            text = self.book_list_announcement_text(index)
             if not text or text == self.last_nvda_announcement:
                 return
             self.last_nvda_announcement = text
@@ -3116,11 +3633,24 @@ class LibraryApp:
                 if selected_index is None:
                     selected_index = 0
                 selected_index = max(0, min(selected_index, self.book_list.size() - 1))
-                self.book_list.selection_clear(0, END)
-                self.book_list.selection_set(selected_index)
-                self.book_list.activate(selected_index)
-                self.book_list.see(selected_index)
-                self.book_list.focus_set()
+                self.select_book_list_index(selected_index, focus=True)
+        except Exception:
+            pass
+
+    def announce_text_to_nvda(self, text):
+        if not self.nvda_book_list_announcements_enabled():
+            return
+        controller = self.get_nvda_controller()
+        if not controller:
+            return
+        try:
+            if controller.nvdaController_testIfRunning() != 0:
+                return
+            text = re.sub(r"\s+", " ", text or "").strip()
+            if not text or text == self.last_nvda_announcement:
+                return
+            self.last_nvda_announcement = text
+            controller.nvdaController_speakText(text)
         except Exception:
             pass
 
@@ -3129,7 +3659,46 @@ class LibraryApp:
         title = re.sub(r"^(?:the|a)\s+", "", title, flags=re.IGNORECASE)
         return title.casefold()
 
+    def book_list_group_index(self, title_key):
+        first = (title_key or "").strip()[:1]
+        for index, (_label, letters) in enumerate(BOOK_LIST_ALPHABET_GROUPS):
+            if letters and first in letters:
+                return index
+        return len(BOOK_LIST_ALPHABET_GROUPS) - 1
+
+    def book_list_group_label_for_index(self, global_index):
+        if global_index is None or global_index < 0 or global_index >= len(self.book_list_titles):
+            return ""
+        group_index = self.book_list_group_index(self.book_list_titles[global_index])
+        if 0 <= group_index < len(BOOK_LIST_ALPHABET_GROUPS):
+            return BOOK_LIST_ALPHABET_GROUPS[group_index][0]
+        return ""
+
+    def normalize_book_list_row(self, row):
+        if not row:
+            return row
+        if len(row) == 13:
+            return row
+        if len(row) == 11:
+            return tuple(row) + ("", "")
+        return (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[6] if len(row) > 6 else "",
+            row[9] if len(row) > 9 else "",
+            row[10] if len(row) > 10 else "",
+            row[11] if len(row) > 11 else "",
+            row[12] if len(row) > 12 else "",
+            row[13] if len(row) > 13 else "",
+            row[21] if len(row) > 21 else "",
+            row[22] if len(row) > 22 else "",
+        )
+
     def format_book_list_row(self, row):
+        row = self.normalize_book_list_row(row)
         (
             _book_id,
             title,
@@ -3142,6 +3711,8 @@ class LibraryApp:
             year,
             isbn,
             publisher,
+            series,
+            series_number,
         ) = row
         values = {
             "title": title or "Untitled",
@@ -3150,6 +3721,8 @@ class LibraryApp:
             "year": year or "Not specified",
             "isbn": isbn or "Not specified",
             "publisher": publisher or "Not specified",
+            "series": series or "Not specified",
+            "series_number": series_number or "Not specified",
             "source": source or "Not specified",
             "tags": tags or "None",
             "format": book_format or "Unknown",
@@ -3158,18 +3731,36 @@ class LibraryApp:
         labels = dict(BOOK_LIST_SPEECH_FIELDS)
         parts = []
         for key in self.get_book_list_speech_fields():
-            if key in {"title", "author", "edition"}:
+            if key in {"title", "author", "edition", "series", "series_number"}:
                 parts.append(f"{values[key]}.")
             else:
                 parts.append(f"{labels[key]}: {values[key]}.")
         prefix = "Selected. " if _book_id in self.marked_book_ids else ""
         return prefix + " ".join(parts)
 
+    def book_list_announcement_text(self, index):
+        if index is None or index < 0 or index >= len(self.book_list_ids):
+            return ""
+        if index < len(self.book_list_announcement_texts):
+            text = self.book_list_announcement_texts[index]
+        else:
+            text = self.book_list.get(index)
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def book_list_column_change_announcement_text(self, index):
+        text = self.book_list_announcement_text(index)
+        group_label = self.book_list_group_label_for_index(index)
+        if group_label:
+            return f"{group_label}. {text}"
+        return text
+
     def book_field_values_for_shortcuts(self, row):
         labels = dict(BOOK_LIST_SPEECH_FIELDS)
         return {
             "title": (labels["title"], row[1] or "Untitled"),
             "author": (labels["author"], row[2] or "Unknown"),
+            "series": (labels["series"], row[21] if len(row) > 21 and row[21] else "Not specified"),
+            "series_number": (labels["series_number"], row[22] if len(row) > 22 and row[22] else "Not specified"),
             "edition": (labels["edition"], row[10] or "Not specified"),
             "year": (labels["year"], row[11] or "Not specified"),
             "isbn": (labels["isbn"], row[12] or "Not specified"),
@@ -3319,31 +3910,35 @@ class LibraryApp:
         backed_book_signature = self.db.get_setting("last_backup_books_signature", "")
         book_signature = f"{book_file_count}:{book_byte_count}"
         changed = db_mtime != backed_mtime or book_signature != backed_book_signature
-        return changed and datetime.utcnow() - last_backup >= interval
+        return changed and datetime.now(timezone.utc).replace(tzinfo=None) - last_backup >= interval
 
     def _start_content_indexer(self):
         threading.Thread(target=self._content_index_worker, daemon=True).start()
 
     def _content_index_worker(self):
+        database = LibraryDatabase()
         while True:
             try:
                 book_id, stored_path = self._index_queue.get(timeout=10)
-                self._index_one_book(book_id, stored_path)
-                self._index_queue.task_done()
+                try:
+                    self._index_one_book(book_id, stored_path, database)
+                finally:
+                    self._index_queue.task_done()
             except queue.Empty:
-                unindexed = self.db.get_unindexed_books()
+                unindexed = database.get_unindexed_books()
                 for book_id, stored_path in unindexed[:5]:
-                    self._index_one_book(book_id, stored_path)
+                    self._index_one_book(book_id, stored_path, database)
 
-    def _index_one_book(self, book_id: int, stored_path: str):
+    def _index_one_book(self, book_id: int, stored_path: str, database=None):
+        database = database or self.db
         try:
             path = Path(stored_path)
             if not path.exists():
                 return
             text = extract_text_for_indexing(path)
-            self.db.index_book_content(book_id, text)
-        except Exception:
-            pass
+            database.index_book_content(book_id, text)
+        except Exception as exc:
+            logger.warning("Could not index book %s at %s: %s", book_id, stored_path, exc)
 
     def queue_book_for_indexing(self, book_id: int, stored_path: str):
         self._index_queue.put((book_id, stored_path))
@@ -3454,11 +4049,68 @@ class LibraryApp:
                 row = connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' AND name='books'"
                 ).fetchone()
-                return row is not None
+                if row is None:
+                    return False
+                integrity = connection.execute("PRAGMA integrity_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    return False
+                columns = {item[1] for item in connection.execute("PRAGMA table_info(books)")}
+                return {"id", "title", "stored_path"}.issubset(columns)
             finally:
                 connection.close()
         except Exception:
             return False
+
+    def validate_backup_contents(self, backup_file, manifest_file, books_folder):
+        if not self.backup_file_is_valid(backup_file):
+            return "The backup database is incomplete or failed its integrity check."
+
+        connection = sqlite3.connect(backup_file)
+        try:
+            book_count = connection.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+            stored_names = {
+                Path(row[0] or "").name
+                for row in connection.execute("SELECT stored_path FROM books")
+                if Path(row[0] or "").name
+            }
+        finally:
+            connection.close()
+
+        manifest = {}
+        if manifest_file and manifest_file.exists():
+            try:
+                manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except Exception:
+                return "The backup manifest could not be read. The backup may still be syncing or damaged."
+            if manifest.get("app") not in {None, APP_NAME}:
+                return "The backup manifest belongs to a different application."
+            try:
+                if "book_count" in manifest and int(manifest["book_count"]) != book_count:
+                    return "The database book count does not match the backup manifest. The backup may be only partly synced."
+            except (TypeError, ValueError):
+                return "The backup manifest contains an invalid book count."
+
+        if books_folder and books_folder.is_dir():
+            actual_count, actual_bytes = folder_file_stats(books_folder)
+            expected_count = manifest.get("backup_book_file_count")
+            expected_bytes = manifest.get("backup_book_byte_count")
+            try:
+                if expected_count is not None and int(expected_count) != actual_count:
+                    return "The backed up book files do not match the manifest count. The backup may be only partly synced."
+                if expected_bytes is not None and int(expected_bytes) != actual_bytes:
+                    return "The backed up book files do not match the manifest size. The backup may be only partly synced."
+            except (TypeError, ValueError):
+                return "The backup manifest contains invalid book file counts or sizes."
+            available_names = {path.name for path in books_folder.rglob("*") if path.is_file()}
+            missing = stored_names - available_names
+            if missing:
+                return f"The backup is missing {len(missing)} book file(s) referenced by its database. No restore was started."
+            if book_count and not actual_count:
+                return "The backup database contains books, but the backed up Books folder is empty."
+        elif book_count and manifest.get("backup_book_file_count") is not None:
+            return "The backup contains book records but its Books folder is missing."
+
+        return ""
 
     def repair_restored_stored_paths(self):
         rows = self.db.connection.execute("SELECT id, stored_path FROM books").fetchall()
@@ -3487,8 +4139,9 @@ class LibraryApp:
         if not backup_file.exists():
             messagebox.showerror("Backup not found", f"No library backup was found here:\n\n{backup_file}")
             return
-        if not self.backup_file_is_valid(backup_file):
-            messagebox.showerror("Backup file not valid", "The backup file does not look like an Accessible Ebook Library Manager database.")
+        validation_error = self.validate_backup_contents(backup_file, _manifest_file, backup_books_folder)
+        if validation_error:
+            messagebox.showerror("Backup not ready to restore", validation_error)
             return
 
         books_backup_available = backup_books_folder and backup_books_folder.exists() and backup_books_folder.is_dir()
@@ -3676,12 +4329,44 @@ class LibraryApp:
 
     def show_watched_folder_status(self):
         folders = self.watched_folders()
-        folder_text = "\n".join(folders) if folders else "None"
         state = "On" if self.watched_folder_auto_scan_enabled() else "Off"
-        messagebox.showinfo(
-            "Watched Folder Status",
-            f"Automatic scanning: {state}\n\nWatched folders:\n{folder_text}"
-        )
+        window = tk.Toplevel(self.root)
+        window.title("Watched Folder Status")
+        window.transient(self.root)
+        window.grab_set()
+
+        main = ttk.Frame(window, padding=12)
+        main.pack(fill=BOTH, expand=True)
+        ttk.Label(main, text=f"Automatic scanning: {state}").pack(anchor="w", pady=(0, 10))
+
+        if not folders:
+            ttk.Label(main, text="No watched folders are configured.").pack(anchor="w")
+        else:
+            ttk.Label(main, text=f"Watched folders: {len(folders)}").pack(anchor="w", pady=(0, 6))
+            path_entries = []
+            for index, folder in enumerate(folders, start=1):
+                ttk.Label(main, text=f"Folder {index} of {len(folders)}").pack(anchor="w")
+                path_var = StringVar(value=folder)
+                entry = ttk.Entry(main, textvariable=path_var, state="readonly", width=80)
+                entry.pack(fill=X, expand=True, pady=(2, 8))
+                path_entries.append(entry)
+
+        button = ttk.Button(main, text="Close", command=window.destroy)
+        button.pack(anchor="e", pady=(4, 0))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.bind("<Return>", lambda _event: window.destroy())
+
+        def focus_status():
+            window.lift()
+            if folders:
+                path_entries[0].focus_force()
+                path_entries[0].selection_range(0, END)
+                path_entries[0].icursor(END)
+            else:
+                button.focus_force()
+
+        window.after(50, focus_status)
+        window.after(200, focus_status)
 
     def schedule_watched_folder_scan(self, delay_ms=None):
         if self.watched_scan_after is not None:
@@ -3704,9 +4389,10 @@ class LibraryApp:
     def scan_watched_folders_now(self):
         self.scan_watched_folders(automatic=False)
 
-    def iter_watched_book_files(self):
-        managed_folder = self.db.books_path
-        for folder_text in self.watched_folders():
+    def iter_watched_book_files(self, folders=None, managed_folder=None):
+        folders = self.watched_folders() if folders is None else folders
+        managed_folder = self.db.books_path if managed_folder is None else managed_folder
+        for folder_text in folders:
             folder = Path(folder_text)
             if not folder.exists():
                 yield None, f"{folder} -- watched folder not found"
@@ -3752,7 +4438,8 @@ class LibraryApp:
         normalized_notice = re.sub(r"\s+", " ", VOICE_DREAM_LIBRARY_NOTICE).strip().casefold()
         return normalized_notice in normalized_text
 
-    def update_existing_watched_book(self, row, source_path: Path):
+    def update_existing_watched_book(self, row, source_path: Path, database=None):
+        database = database or self.db
         stored_path = Path(row[8])
         if not stored_path.exists():
             destination = self.unique_destination(
@@ -3760,24 +4447,25 @@ class LibraryApp:
                 source_path.suffix.lower(),
             )
             shutil.copy2(source_path, destination)
-            self.db.connection.execute(
+            database.connection.execute(
                 "UPDATE books SET stored_path = ?, format = ? WHERE id = ?",
                 (str(destination), destination.suffix.lower().lstrip("."), row[0]),
             )
-            self.db.connection.commit()
+            database.connection.commit()
             stored_path = destination
         else:
             shutil.copy2(source_path, stored_path)
         if stored_path.suffix.lower() == ".epub":
-            self.update_accessibility_from_epub(row[0], stored_path)
+            self.update_accessibility_from_epub(row[0], stored_path, database=database)
 
-    def watched_file_matches_existing_book(self, source_path: Path):
+    def watched_file_matches_existing_book(self, source_path: Path, database=None):
+        database = database or self.db
         try:
             source_stat = source_path.stat()
         except Exception:
             return None
 
-        for row in self.db.all_books_for_duplicate_check():
+        for row in database.all_books_for_duplicate_check():
             stored_path = Path(row[8])
             try:
                 if source_path.resolve() == stored_path.resolve():
@@ -3800,11 +4488,21 @@ class LibraryApp:
                 continue
         return None
 
-    def watched_file_matches_existing_metadata(self, source_path: Path):
+    def watched_file_matches_existing_metadata(self, source_path: Path, database=None):
+        database = database or self.db
         if source_path.suffix.lower() == ".zip":
             return None, ""
 
-        detected = self.guess_metadata_from_file(source_path)
+        if source_path.suffix.lower() == ".epub":
+            # A Bookshare or Learning Ally title keeps its library ID however the
+            # file is renamed, so it is a more reliable match than the title.
+            library_id = extract_source_book_id(source_path)
+            matching_id = database.find_book_id_by_source_book_id(library_id)
+            matching_row = database.get_book(matching_id) if matching_id else None
+            if matching_row:
+                return matching_row, f"same library book ID {library_id}"
+
+        detected = self.guess_metadata_from_file(source_path, database=database)
         detected_isbn = normalize_isbn_key(detected.get("isbn", ""))
         source_title = detected.get("title", "")
         filename_title = clean_filename_title(source_path)
@@ -3813,7 +4511,7 @@ class LibraryApp:
         detected_metadata_score = metadata_score_from_detection(detected)
         source_extension = source_path.suffix.lower().lstrip(".")
 
-        for row in self.db.all_books_for_duplicate_check():
+        for row in database.all_books_for_duplicate_check():
             row_isbn = normalize_isbn_key(row[12] or "")
             if detected_isbn and row_isbn and detected_isbn == row_isbn:
                 return row, f"same ISBN {detected_isbn}"
@@ -3855,66 +4553,124 @@ class LibraryApp:
     def scan_watched_folders(self, automatic=False):
         if self.watched_scan_running:
             return
-        if not self.watched_folders():
+        folders = self.watched_folders()
+        if not folders:
             if not automatic:
                 messagebox.showinfo("Watched Folders", "No watched folders are set. Add one from Settings, Watched Folders.")
             return
 
         self.watched_scan_running = True
-        imported = 0
-        updated = 0
-        skipped = []
+        events = queue.Queue()
+        progress_window = None
+        message_var = None
+        progress = None
+        if not automatic:
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Scanning Watched Folders")
+            progress_window.transient(self.root)
+            progress_window.resizable(False, False)
+            progress_window.protocol("WM_DELETE_WINDOW", lambda: None)
+            message_var = StringVar(value="Scanning watched folders.")
+            ttk.Label(progress_window, textvariable=message_var, padding=12).pack(fill=X)
+            progress = ttk.Progressbar(progress_window, mode="indeterminate", length=360)
+            progress.pack(fill=X, padx=12, pady=(0, 12))
+            progress.start(12)
+        self.status_var.set("Scanning watched folders in the background.")
         signatures = self.watched_file_signatures()
-        try:
-            self.status_var.set("Scanning watched folders.")
-            self.root.update_idletasks()
-            for path, error in self.iter_watched_book_files():
-                if error:
-                    skipped.append(error)
-                    continue
-                if path is None:
-                    continue
-                canonical = self.canonical_path_text(path)
-                signature = self.file_signature(path)
-                if signature and signatures.get(canonical) == signature:
-                    continue
-                try:
-                    existing = self.db.get_book_by_original_path(canonical)
-                    if existing and path.suffix.lower() != ".zip":
-                        self.update_existing_watched_book(existing, path)
-                        updated += 1
-                    elif self.watched_file_matches_existing_book(path):
-                        skipped.append(f"{path} -- already in library")
+
+        def worker():
+            database = None
+            imported = 0
+            updated = 0
+            skipped = []
+            scan_signatures = dict(signatures)
+            try:
+                database = LibraryDatabase()
+                for path, error in self.iter_watched_book_files(folders, database.books_path):
+                    if error:
+                        skipped.append(error)
+                        continue
+                    if path is None:
+                        continue
+                    canonical = self.canonical_path_text(path)
+                    signature = self.file_signature(path)
+                    if signature and scan_signatures.get(canonical) == signature:
+                        continue
+                    events.put(("progress", path.name))
+                    try:
+                        existing = database.get_book_by_original_path(canonical)
+                        if existing and path.suffix.lower() != ".zip":
+                            self.update_existing_watched_book(existing, path, database=database)
+                            updated += 1
+                        elif self.watched_file_matches_existing_book(path, database=database):
+                            skipped.append(f"{path} -- already in library")
+                        else:
+                            matched_row, match_reason = self.watched_file_matches_existing_metadata(path, database=database)
+                            if matched_row:
+                                skipped.append(f"{path} -- already in library as {matched_row[1]} ({match_reason})")
+                            elif path.suffix.lower() == ".zip":
+                                zip_imported, zip_skipped = self.import_zip_file_without_prompt(
+                                    path, default_source="Watched Folder", database=database
+                                )
+                                imported += zip_imported
+                                skipped.extend(zip_skipped)
+                            elif self.import_one_book_without_prompt(path, default_source="Watched Folder", database=database):
+                                imported += 1
+                        if signature:
+                            scan_signatures[canonical] = signature
+                    except sqlite3.IntegrityError:
+                        if signature:
+                            scan_signatures[canonical] = signature
+                        skipped.append(f"{path} -- already imported")
+                    except Exception as exc:
+                        skipped.append(f"{path} -- {exc}")
+                        logger.exception("Watched folder scan failed for %s", path)
+                report_path = self.write_import_report(imported + updated, skipped) if (skipped or imported or updated) else ""
+                events.put(("done", imported, updated, skipped, scan_signatures, report_path, ""))
+            except Exception as exc:
+                logger.exception("Watched folder scan failed")
+                events.put(("done", imported, updated, skipped, scan_signatures, "", str(exc)))
+            finally:
+                if database is not None:
+                    database.close()
+
+        def poll():
+            try:
+                while True:
+                    event = events.get_nowait()
+                    if event[0] == "progress":
+                        message = f"Checking: {event[1]}"
+                        self.status_var.set(message)
+                        if message_var is not None:
+                            message_var.set(message)
                     else:
-                        matched_row, match_reason = self.watched_file_matches_existing_metadata(path)
-                        if matched_row:
-                            skipped.append(f"{path} -- already in library as {matched_row[1]} ({match_reason})")
-                        elif path.suffix.lower() == ".zip":
-                            zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="Watched Folder")
-                            imported += zip_imported
-                            skipped.extend(zip_skipped)
-                        elif self.import_one_book_without_prompt(path, default_source="Watched Folder"):
-                            imported += 1
-                    if signature:
-                        signatures[canonical] = signature
-                except sqlite3.IntegrityError:
-                    if signature:
-                        signatures[canonical] = signature
-                    skipped.append(f"{path} -- already imported")
-                except Exception as exc:
-                    skipped.append(f"{path} -- {exc}")
-                    self.log_error(f"Watched folder scan: {path}", exc)
-            self.save_watched_file_signatures(signatures)
-            if imported or updated:
-                self.refresh_books()
-            if skipped or imported or updated:
-                self.write_import_report(imported + updated, skipped)
-            message = f"Watched folder scan complete. Imported {imported}. Updated {updated}. Skipped {len(skipped)}."
-            self.status_var.set(message)
-            if not automatic:
-                messagebox.showinfo("Watched Folder Scan", message)
-        finally:
-            self.watched_scan_running = False
+                        _kind, imported, updated, skipped, signatures, report_path, error = event
+                        self.watched_scan_running = False
+                        if progress_window is not None:
+                            progress.stop()
+                            progress_window.destroy()
+                        if error:
+                            self.status_var.set("Watched folder scan failed.")
+                            if not automatic:
+                                messagebox.showerror("Watched Folder Scan Failed", error)
+                            return
+                        self.save_watched_file_signatures(signatures)
+                        if imported or updated:
+                            self.refresh_books()
+                        message = f"Watched folder scan complete. Imported {imported}. Updated {updated}. Skipped {len(skipped)}."
+                        self.status_var.set(message)
+                        if not automatic and skipped:
+                            message += f"\n\nImport report saved at:\n{report_path}"
+                        if not automatic:
+                            messagebox.showinfo("Watched Folder Scan", message)
+                        return
+            except queue.Empty:
+                pass
+            if self.watched_scan_running:
+                self.root.after(100, poll)
+
+        threading.Thread(target=worker, daemon=True, name="watched-folder-scan").start()
+        self.root.after(100, poll)
 
     def explorer_context_menu_registry_paths(self):
         paths = []
@@ -4029,30 +4785,115 @@ class LibraryApp:
         return "break"
 
     def focus_books_list(self):
-        self.book_list.focus_set()
-        if self.book_list.size() > 0 and not self.book_list.curselection():
-            self.book_list.selection_set(0)
-            self.book_list.activate(0)
+        if self.book_list.size() == 0:
+            target = self.first_visible_book_list_widget()
+            if target is not None:
+                target.focus_set()
+            self.status_var.set("No books are shown.")
+            return
+        index = self.current_book_index_quiet()
+        if index is None:
+            index = 0
+        self.select_book_list_index(index, focus=True)
         self.status_var.set("Books list focused. Use up and down arrow to choose a book.")
 
     def settle_book_list_focus(self, selected_index=None):
         if self.book_list.size() == 0:
-            self.book_list.focus_force()
+            target = self.first_visible_book_list_widget()
+            if target is not None:
+                target.focus_force()
             return
         if selected_index is None:
-            selected = self.book_list.curselection()
-            if selected:
-                selected_index = selected[0]
-            else:
-                try:
-                    selected_index = self.book_list.index("active")
-                except Exception:
-                    selected_index = 0
+            selected_index = self.current_book_index_quiet()
+            if selected_index is None:
+                selected_index = 0
         selected_index = max(0, min(selected_index, self.book_list.size() - 1))
-        self.book_list.focus_set()
-        self.select_book_list_index(selected_index)
+        self.select_book_list_index(selected_index, focus=True)
 
-    def select_book_list_index(self, index):
+    def first_visible_book_list_widget(self):
+        if self.is_multiple_book_list_mode() and self.multi_book_lists:
+            if 0 <= self.active_multi_book_column < len(self.multi_book_lists):
+                return self.multi_book_lists[self.active_multi_book_column]
+            return self.multi_book_lists[0]
+        return self.book_list
+
+    def focused_multi_book_list(self):
+        focused = self.root.focus_get()
+        if focused in self.multi_book_lists:
+            return focused
+        return None
+
+    def multi_book_list_position_for_global_index(self, global_index):
+        for column_index, index_map in enumerate(self.multi_book_list_index_maps):
+            if global_index in index_map:
+                return column_index, index_map.index(global_index)
+        return None, None
+
+    def global_index_from_multi_widget(self, widget):
+        if widget not in self.multi_book_lists:
+            return None
+        column_index = self.multi_book_lists.index(widget)
+        index_map = self.multi_book_list_index_maps[column_index]
+        selected = widget.curselection()
+        if selected:
+            local_index = selected[0]
+        else:
+            try:
+                local_index = widget.index("active")
+            except Exception:
+                return None
+        if local_index < 0 or local_index >= len(index_map):
+            return None
+        return index_map[local_index]
+
+    def select_multi_book_list_index(self, global_index, focus_widget=None, focus=False):
+        if not self.multi_book_lists:
+            return
+        target_widget = focus_widget
+        for listbox in self.multi_book_lists:
+            listbox.selection_clear(0, END)
+        column_index, local_index = self.multi_book_list_position_for_global_index(global_index)
+        if column_index is None:
+            return
+        self.active_multi_book_column = column_index
+        self.show_active_multi_book_column()
+        target_widget = target_widget or self.multi_book_lists[column_index]
+        listbox = self.multi_book_lists[column_index]
+        listbox.selection_set(local_index)
+        listbox.activate(local_index)
+        listbox.see(local_index)
+        if focus and target_widget in self.multi_book_lists:
+            target_widget.focus_set()
+
+    def restore_temporary_column_announcement_item(self):
+        item = self.temporary_column_announcement_item
+        self.temporary_column_announcement_item = None
+        if not item:
+            return
+        listbox, local_index, original_text = item
+        try:
+            if 0 <= local_index < listbox.size():
+                listbox.delete(local_index)
+                listbox.insert(local_index, original_text)
+        except Exception:
+            pass
+
+    def set_temporary_column_announcement_item(self, listbox, local_index, text):
+        self.restore_temporary_column_announcement_item()
+        try:
+            if local_index < 0 or local_index >= listbox.size():
+                return
+            original_text = listbox.get(local_index)
+            listbox.delete(local_index)
+            listbox.insert(local_index, text)
+            self.temporary_column_announcement_item = (listbox, local_index, original_text)
+            self.root.after(1500, self.restore_temporary_column_announcement_item)
+        except Exception:
+            self.temporary_column_announcement_item = None
+
+    def select_book_list_index(self, index, focus=None, focus_widget=None, announce=True):
+        if announce:
+            self.restore_temporary_column_announcement_item()
         if self.book_list.size() == 0:
             return
         index = max(0, min(index, self.book_list.size() - 1))
@@ -4061,14 +4902,24 @@ class LibraryApp:
         self.book_list.selection_set(index)
         self.book_list.activate(index)
         self.book_list.see(index)
-        self.book_list.focus_set()
+        if self.is_multiple_book_list_mode():
+            if focus is None:
+                focus = True
+            self.select_multi_book_list_index(index, focus_widget=focus_widget, focus=focus)
+        elif focus or focus is None:
+            self.book_list.focus_set()
         if book_id is not None:
-            prefix = "Selected. " if book_id in self.marked_book_ids else ""
-            self.status_var.set(prefix + self.book_list.get(index))
+            if announce:
+                self.status_var.set(self.book_list_announcement_text(index))
+            else:
+                self.suppress_next_book_list_select_announcement = True
             self.play_missing_metadata_sound_if_needed(book_id)
-            self.announce_current_book_to_nvda(index)
+            if announce:
+                self.announce_current_book_to_nvda(index)
+            self.schedule_cover_preview_update(book_id)
         else:
             self.status_var.set(self.book_list.get(index))
+            self.clear_cover_preview()
 
     def move_to_first_book(self, event=None):
         if self.book_list.size() == 0:
@@ -4082,6 +4933,49 @@ class LibraryApp:
             self.status_var.set("No books are shown.")
             return "break"
         self.select_book_list_index(self.book_list.size() - 1)
+        return "break"
+
+    def move_between_book_columns(self, event, direction):
+        if not self.is_multiple_book_list_mode() or event.widget not in self.multi_book_lists:
+            return None
+        if self.book_list.size() == 0:
+            self.status_var.set("No books are shown.")
+            return "break"
+
+        current_column = self.multi_book_lists.index(event.widget)
+        selected = event.widget.curselection()
+        if selected:
+            current_local_index = selected[0]
+        else:
+            try:
+                current_local_index = event.widget.index("active")
+            except Exception:
+                current_local_index = 0
+
+        column_count = len(self.multi_book_lists)
+        for offset in range(1, column_count + 1):
+            next_column = (current_column + (offset * direction)) % column_count
+            index_map = self.multi_book_list_index_maps[next_column]
+            if not index_map:
+                continue
+            next_local_index = min(current_local_index, len(index_map) - 1)
+            next_global_index = index_map[next_local_index]
+            text = self.book_list_column_change_announcement_text(next_global_index)
+            self.set_temporary_column_announcement_item(
+                self.multi_book_lists[next_column],
+                next_local_index,
+                text,
+            )
+            self.select_book_list_index(
+                next_global_index,
+                focus=True,
+                focus_widget=self.multi_book_lists[next_column],
+                announce=False,
+            )
+            self.status_var.set(text)
+            self.announce_text_to_nvda(text)
+            return "break"
+
         return "break"
 
     def toggle_mark_current_book(self, event=None):
@@ -4128,7 +5022,14 @@ class LibraryApp:
         return "break"
 
     def on_book_list_select(self, event=None):
+        if event is not None and event.widget in self.multi_book_lists:
+            index = self.global_index_from_multi_widget(event.widget)
+            if index is not None:
+                self.select_book_list_index(index, focus=False, focus_widget=event.widget)
         self.root.after(1, self.sound_for_current_selection)
+        book_id = self.selected_book_id_quiet()
+        if book_id is not None:
+            self.schedule_cover_preview_update(book_id)
         return None
 
     def on_book_list_keypress(self, event):
@@ -4164,7 +5065,7 @@ class LibraryApp:
         else:
             return "break"
 
-        if field_index < 0 or field_index >= len(BOOK_LIST_SPEECH_FIELDS):
+        if field_index < 0 or field_index >= len(BOOK_LIST_SHORTCUT_FIELDS):
             return "break"
 
         book_id = self.selected_book_id_quiet()
@@ -4176,7 +5077,7 @@ class LibraryApp:
             messagebox.showerror("Book not found", "The selected book was not found.")
             return "break"
 
-        field_key, _default_label = BOOK_LIST_SPEECH_FIELDS[field_index]
+        field_key = BOOK_LIST_SHORTCUT_FIELDS[field_index]
         values = self.book_field_values_for_shortcuts(row)
         label, value = values[field_key]
         now = time.monotonic()
@@ -4199,14 +5100,12 @@ class LibraryApp:
     def sound_for_current_selection(self):
         if self.book_list.size() == 0:
             return
-        selected = self.book_list.curselection()
-        if selected:
-            index = selected[0]
-        else:
-            try:
-                index = self.book_list.index("active")
-            except Exception:
-                return
+        if self.suppress_next_book_list_select_announcement:
+            self.suppress_next_book_list_select_announcement = False
+            return
+        index = self.current_book_index_quiet()
+        if index is None:
+            return
         if index < 0 or index >= len(self.book_list_ids):
             return
         self.play_missing_metadata_sound_if_needed(self.book_list_ids[index])
@@ -4229,7 +5128,7 @@ class LibraryApp:
         messagebox.showinfo(
             "Search Library",
             "Search looks through both library metadata and the full text content of your books.\n\n"
-            "Metadata searched: title, author, source, tags, format, notes, edition, year, ISBN, and publisher.\n\n"
+            "Metadata searched: title, author, series, series number, source, tags, format, notes, edition, year, ISBN, and publisher.\n\n"
             "Book content is indexed in the background when you add books. "
             "If a book was added before content indexing was available, use Search, Re-index Book Content to index your existing library."
         )
@@ -4240,13 +5139,20 @@ class LibraryApp:
             self.root.after(50, self.settle_book_list_focus)
             self.root.after(200, self.settle_book_list_focus)
         else:
-            self.book_list.focus_force()
+            target = self.first_visible_book_list_widget()
+            if target is not None:
+                target.focus_force()
             self.status_var.set("No books matched the search.")
 
     def refresh_books(self, selected_book_id=None):
+        self.temporary_column_announcement_item = None
         self.book_list.delete(0, END)
+        for listbox in self.multi_book_lists:
+            listbox.delete(0, END)
         self.book_list_ids = []
         self.book_list_titles = []
+        self.book_list_announcement_texts = []
+        self.multi_book_list_index_maps = [[] for _listbox in self.multi_book_lists]
 
         query = self.search_var.get()
         content_ids = self.db.search_content(query) if query.strip() else None
@@ -4258,11 +5164,21 @@ class LibraryApp:
             format_filter=self.filter_format,
             extra_ids=content_ids,
         )
+        if self.active_saved_view == "missing_metadata":
+            rows = [row for row in rows if self.row_missing_metadata_for_view(row)]
         for row in rows:
             book_id = row[0]
-            self.book_list.insert(END, self.format_book_list_row(row))
+            row_text = self.format_book_list_row(row)
+            title_key = self.navigation_title_key(row[1])
+            global_index = len(self.book_list_ids)
+            self.book_list.insert(END, row_text)
             self.book_list_ids.append(book_id)
-            self.book_list_titles.append(self.navigation_title_key(row[1]))
+            self.book_list_titles.append(title_key)
+            self.book_list_announcement_texts.append(row_text)
+            if self.multi_book_lists:
+                group_index = self.book_list_group_index(title_key)
+                self.multi_book_lists[group_index].insert(END, row_text)
+                self.multi_book_list_index_maps[group_index].append(global_index)
 
         count = len(rows)
         self.status_var.set(
@@ -4279,11 +5195,101 @@ class LibraryApp:
                     selected_index = 0
 
             self.select_book_list_index(selected_index)
+        else:
+            self.show_active_multi_book_column()
+            self.clear_cover_preview()
+
+    def clear_cover_preview(self, text="No cover"):
+        if not hasattr(self, "cover_preview_label"):
+            return
+        self.cover_preview_book_id = None
+        self.cover_preview_photo = None
+        self.cover_preview_label.configure(image="", text=text)
+        self.cover_preview_title_var.set("")
+
+    def schedule_cover_preview_update(self, book_id):
+        if not hasattr(self, "cover_preview_label"):
+            return
+        if self.cover_preview_after is not None:
+            try:
+                self.root.after_cancel(self.cover_preview_after)
+            except Exception:
+                pass
+        self.cover_preview_after = self.root.after(150, lambda: self.update_cover_preview(book_id))
+
+    def update_cover_preview(self, book_id):
+        self.cover_preview_after = None
+        self.cover_preview_book_id = book_id
+        row = self.db.get_book(book_id)
+        if not row:
+            self.clear_cover_preview()
+            return
+
+        title = row[1] or "Selected book"
+        cover_url = row[14] if len(row) > 14 else ""
+        self.cover_preview_title_var.set(title)
+        if not cover_url:
+            self.cover_preview_photo = None
+            self.cover_preview_label.configure(image="", text="No cover saved")
+            return
+
+        cached = self.cover_image_cache.get(cover_url)
+        if cached is not None:
+            self.cover_preview_photo = cached
+            self.cover_preview_label.configure(image=cached, text="")
+            return
+
+        self.cover_preview_photo = None
+        self.cover_preview_label.configure(image="", text="Loading cover")
+
+        def worker(expected_book_id, url):
+            data = None
+            error = None
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    data = response.read(2_000_000)
+            except Exception as exc:
+                error = exc
+            self.root.after(0, lambda: self.finish_cover_preview_load(expected_book_id, url, data, error))
+
+        threading.Thread(target=worker, args=(book_id, cover_url), daemon=True).start()
+
+    def finish_cover_preview_load(self, expected_book_id, cover_url, data, error):
+        if self.cover_preview_book_id != expected_book_id:
+            return
+        photo = None
+        if data is not None:
+            try:
+                from PIL import Image, ImageTk
+                image = Image.open(BytesIO(data))
+                image.thumbnail((170, 240))
+                photo = ImageTk.PhotoImage(image)
+            except Exception:
+                photo = None
+        if photo is None:
+            self.cover_preview_photo = None
+            self.cover_preview_label.configure(image="", text="Cover available")
+            return
+        self.cover_image_cache[cover_url] = photo
+        self.cover_preview_photo = photo
+        self.cover_preview_label.configure(image=photo, text="")
 
     def current_book_index(self):
         """Return the active list index, and make it the selection."""
         if self.book_list.size() == 0:
             return None
+
+        if self.is_multiple_book_list_mode():
+            focused_listbox = self.focused_multi_book_list()
+            index = self.global_index_from_multi_widget(focused_listbox) if focused_listbox is not None else None
+            if index is None:
+                index = self.current_book_index_quiet()
+            if index is None:
+                index = 0
+            index = max(0, min(index, self.book_list.size() - 1))
+            self.select_book_list_index(index, focus=False, focus_widget=focused_listbox)
+            return index
 
         try:
             index = self.book_list.index("active")
@@ -4303,6 +5309,13 @@ class LibraryApp:
     def current_book_index_quiet(self):
         if self.book_list.size() == 0:
             return None
+
+        if self.is_multiple_book_list_mode():
+            focused_listbox = self.focused_multi_book_list()
+            if focused_listbox is not None:
+                index = self.global_index_from_multi_widget(focused_listbox)
+                if index is not None:
+                    return index
 
         selected = self.book_list.curselection()
         if selected:
@@ -4368,6 +5381,8 @@ class LibraryApp:
             text = (
                 f"Title: {row[1]}\n"
                 f"Author: {row[2] or 'Unknown'}\n"
+                f"Series: {row[21] if len(row) > 21 and row[21] else 'Not specified'}\n"
+                f"Series number: {row[22] if len(row) > 22 and row[22] else 'Not specified'}\n"
                 f"Edition: {row[10] or 'Not specified'}\n"
                 f"Year: {row[11] or 'Not specified'}\n"
                 f"ISBN: {row[12] or 'Not specified'}\n"
@@ -4394,12 +5409,13 @@ class LibraryApp:
         except Exception:
             pass
 
-    def update_accessibility_from_epub(self, book_id, stored_path):
+    def update_accessibility_from_epub(self, book_id, stored_path, database=None):
+        database = database or self.db
         path = Path(stored_path)
         if path.suffix.lower() != ".epub" or not path.exists():
             return {}
         metadata = read_epub_accessibility_metadata(path)
-        self.db.update_accessibility_metadata(book_id, metadata)
+        database.update_accessibility_metadata(book_id, metadata)
         return metadata
 
     def accessibility_text_from_row(self, row):
@@ -4453,7 +5469,8 @@ class LibraryApp:
 
         return supported_inside
 
-    def import_zip_file_without_prompt(self, zip_path: Path, default_source: str = "") -> tuple[int, list[str]]:
+    def import_zip_file_without_prompt(self, zip_path: Path, default_source: str = "", database=None) -> tuple[int, list[str]]:
+        database = database or self.db
         imported = 0
         skipped = []
 
@@ -4471,7 +5488,7 @@ class LibraryApp:
 
         for inner_file in inner_files:
             try:
-                if self.import_one_book_without_prompt(inner_file, default_source=default_source):
+                if self.import_one_book_without_prompt(inner_file, default_source=default_source, database=database):
                     imported += 1
                 else:
                     skipped.append(f"{inner_file} -- unsupported or not imported")
@@ -4482,18 +5499,20 @@ class LibraryApp:
 
         return imported, skipped
 
-    def guess_metadata_from_file(self, source_path: Path) -> dict:
+    def guess_metadata_from_file(self, source_path: Path, database=None) -> dict:
+        database = database or getattr(self, "db", None)
         default_title = clean_filename_title(source_path)
-        metadata = {"title": default_title, "author": "", "edition": "", "year": "", "isbn": "", "publisher": "", "source": "", "tags": "", "notes": ""}
+        metadata = {"title": default_title, "author": "", "series": "", "series_number": "", "edition": "", "year": "", "isbn": "", "publisher": "", "source": "", "tags": "", "notes": ""}
 
         if source_path.suffix.lower() == ".epub":
             epub_metadata = read_epub_metadata(source_path)
             metadata.update({key: value for key, value in epub_metadata.items() if value})
 
-        if source_path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS and self.calibre_metadata_reading_enabled():
+        if source_path.suffix.lower() in CALIBRE_METADATA_EXTENSIONS and self.calibre_metadata_reading_enabled(database):
             calibre_metadata = read_calibre_metadata(source_path)
             metadata.update({key: value for key, value in calibre_metadata.items() if value})
 
+        metadata["tags"] = normalize_import_tags(metadata["tags"])
         return detect_metadata_from_text(source_path, existing=metadata)
 
     def is_file_ready_for_import(self, source_path: Path) -> tuple[bool, str]:
@@ -4570,50 +5589,15 @@ class LibraryApp:
         paths = self.command_line_import_paths()
         if not paths:
             return
+        self.start_folder_import(paths, "File Explorer", [])
 
-        imported = 0
-        skipped = []
-        for path in paths:
-            try:
-                if path.suffix.lower() == ".zip":
-                    zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source="File Explorer")
-                    imported += zip_imported
-                    skipped.extend(zip_skipped)
-                elif self.import_one_book_without_prompt(path, default_source="File Explorer"):
-                    imported += 1
-                else:
-                    skipped.append(f"{path} -- unsupported or not imported")
-            except sqlite3.IntegrityError:
-                skipped.append(f"{path} -- already imported or duplicate stored path")
-            except Exception as exc:
-                skipped.append(f"{path} -- {exc}")
-
-        self.refresh_books()
-        if imported:
-            self.focus_books_list()
-        report_path = self.write_import_report(imported, skipped)
-        self.status_var.set(
-            f"File Explorer import complete. Imported {imported}. Skipped {len(skipped)}."
-        )
-        if skipped:
-            messagebox.showwarning(
-                "File Explorer import finished with warnings",
-                f"Imported {imported} book{'s' if imported != 1 else ''}. "
-                f"Skipped {len(skipped)} item{'s' if len(skipped) != 1 else ''}.\n\n"
-                f"Import report saved at:\n{report_path}"
-            )
-        else:
-            messagebox.showinfo(
-                "File Explorer import complete",
-                f"Imported {imported} book{'s' if imported != 1 else ''}."
-            )
-
-    def import_one_book_without_prompt(self, source_path: Path, default_source: str = "") -> bool:
+    def import_one_book_without_prompt(self, source_path: Path, default_source: str = "", database=None) -> bool:
+        database = database or self.db
         if self.is_ignored_import_file(source_path):
             raise OSError("ignored helper file")
 
         if source_path.suffix.lower() == ".zip":
-            imported, skipped = self.import_zip_file_without_prompt(source_path, default_source=default_source)
+            imported, skipped = self.import_zip_file_without_prompt(source_path, default_source=default_source, database=database)
             if imported:
                 return True
             raise OSError("; ".join(skipped) if skipped else "ZIP contained no importable books")
@@ -4622,7 +5606,7 @@ class LibraryApp:
         if not ready:
             raise OSError(reason)
 
-        metadata = self.guess_metadata_from_file(source_path)
+        metadata = self.guess_metadata_from_file(source_path, database=database)
         if default_source and not metadata.get("source"):
             metadata["source"] = default_source
 
@@ -4644,7 +5628,7 @@ class LibraryApp:
                 # Folder import should not stop because one EPUB metadata write failed.
                 pass
 
-        new_book_id = self.db.add_book(
+        new_book_id = database.add_book(
             metadata["title"],
             metadata["author"],
             metadata["source"],
@@ -4653,14 +5637,15 @@ class LibraryApp:
             self.canonical_path_text(source_path),
             str(destination),
         )
-        self.db.update_extra_fields(
+        database.update_extra_fields(
             new_book_id,
             metadata.get("edition", ""),
             metadata.get("year", ""),
             metadata.get("isbn", ""),
             metadata.get("publisher", ""),
         )
-        self.update_accessibility_from_epub(new_book_id, destination)
+        database.update_series_fields(new_book_id, metadata.get("series", ""), metadata.get("series_number", ""))
+        self.update_accessibility_from_epub(new_book_id, destination, database=database)
         self.queue_book_for_indexing(new_book_id, str(destination))
         return True
 
@@ -4685,109 +5670,7 @@ class LibraryApp:
                 default_source = ""
 
             root_folder = Path(folder)
-
-            try:
-                if include_subfolders:
-                    candidates_iter = root_folder.rglob("*")
-                else:
-                    candidates_iter = root_folder.iterdir()
-
-                candidates = []
-                skipped_items = []
-                for candidate in candidates_iter:
-                    try:
-                        if candidate.is_file():
-                            candidates.append(candidate)
-                    except Exception as exc:
-                        skipped_items.append(f"{candidate} -- could not inspect file: {exc}")
-
-            except Exception as exc:
-                self.log_error("Listing import folder", exc)
-                messagebox.showerror(
-                    "Folder import failed",
-                    f"I could not read this folder.\n\n{exc}\n\nCrash details saved at:\n{self.crash_log_path()}"
-                )
-                return
-
-            supported = []
-            for path in candidates:
-                try:
-                    if self.is_ignored_import_file(path):
-                        skipped_items.append(f"{path} -- ignored helper file")
-                    elif path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                        supported.append(path)
-                except Exception as exc:
-                    skipped_items.append(f"{path} -- could not check extension: {exc}")
-
-            if not supported:
-                report_path = self.write_import_report(0, skipped_items)
-                messagebox.showinfo(
-                    "No supported books found",
-                    f"No supported ebook or document files were found in that folder.\n\nReport saved at:\n{report_path}"
-                )
-                return
-
-            if len(supported) > 1 and messagebox.askyesno(
-                "One book in multiple parts?",
-                "Does this folder contain one book split into multiple part files?\n\n"
-                "Choose Yes to combine the files into one EPUB and add one book to the library. "
-                "Choose No to import each file as a separate book."
-            ):
-                self.start_combined_folder_import(
-                    root_folder,
-                    sorted(supported, key=book_part_sort_key),
-                    default_source.strip(),
-                    skipped_items,
-                )
-                return
-
-            if not messagebox.askyesno(
-                "Confirm folder import",
-                f"Found {len(supported)} supported file{'s' if len(supported) != 1 else ''}. Import them now?"
-            ):
-                return
-
-            imported = 0
-
-            for path in supported:
-                try:
-                    # Keep UI responsive enough during large imports.
-                    self.status_var.set(f"Importing: {path.name}")
-                    self.root.update_idletasks()
-
-                    if path.suffix.lower() == ".zip":
-                        zip_imported, zip_skipped = self.import_zip_file_without_prompt(path, default_source=default_source.strip())
-                        imported += zip_imported
-                        skipped_items.extend(zip_skipped)
-                    elif self.import_one_book_without_prompt(path, default_source=default_source.strip()):
-                        imported += 1
-                    else:
-                        skipped_items.append(f"{path} -- unsupported or not imported")
-                except sqlite3.IntegrityError as exc:
-                    skipped_items.append(f"{path} -- already imported or duplicate stored path")
-                    self.log_error(f"Duplicate during folder import: {path}", exc)
-                except Exception as exc:
-                    skipped_items.append(f"{path} -- {exc}")
-                    self.log_error(f"Importing file: {path}", exc)
-
-            report_path = self.write_import_report(imported, skipped_items)
-
-            try:
-                self.refresh_books()
-                if imported:
-                    self.focus_books_list()
-            except Exception as exc:
-                self.log_error("Refreshing after folder import", exc)
-
-            skipped = len(skipped_items)
-            messagebox.showinfo(
-                "Folder import complete",
-                f"Imported {imported} book{'s' if imported != 1 else ''}. "
-                f"Skipped {skipped} file{'s' if skipped != 1 else ''}.\n\n"
-                f"Import report saved at:\n{report_path}\n\n"
-                f"If the app crashed before, check:\n{self.crash_log_path()}"
-            )
-            self.status_var.set(f"Folder import complete. Imported {imported}. Skipped {skipped}.")
+            self.start_folder_discovery(root_folder, include_subfolders, default_source.strip())
         except Exception as exc:
             self.log_error("Fatal folder import error", exc)
             messagebox.showerror(
@@ -4795,6 +5678,170 @@ class LibraryApp:
                 f"Folder import hit an unexpected error, but the app caught it this time.\n\n{exc}\n\n"
                 f"Crash details saved at:\n{self.crash_log_path()}"
             )
+
+    def start_folder_discovery(self, root_folder, include_subfolders, default_source):
+        if self.folder_discovery_running or self.folder_import_running:
+            return
+        self.folder_discovery_running = True
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Searching for Books")
+        progress_window.transient(self.root)
+        progress_window.resizable(False, False)
+        progress_window.protocol("WM_DELETE_WINDOW", lambda: None)
+        message_var = StringVar(value="Searching the selected folder.")
+        ttk.Label(progress_window, textvariable=message_var, padding=12).pack(fill=X)
+        progress = ttk.Progressbar(progress_window, mode="indeterminate", length=360)
+        progress.pack(fill=X, padx=12, pady=(0, 12))
+        progress.start(12)
+        events = queue.Queue()
+
+        def worker():
+            supported = []
+            skipped = []
+            try:
+                candidates = root_folder.rglob("*") if include_subfolders else root_folder.iterdir()
+                for candidate in candidates:
+                    try:
+                        if not candidate.is_file():
+                            continue
+                        if self.is_ignored_import_file(candidate):
+                            skipped.append(f"{candidate} -- ignored helper file")
+                        elif candidate.suffix.lower() in SUPPORTED_EXTENSIONS:
+                            supported.append(candidate)
+                    except Exception as exc:
+                        skipped.append(f"{candidate} -- could not inspect file: {exc}")
+                events.put(("done", supported, skipped, ""))
+            except Exception as exc:
+                logger.exception("Listing import folder failed: %s", root_folder)
+                events.put(("done", supported, skipped, str(exc)))
+
+        def poll():
+            try:
+                _kind, supported, skipped, error = events.get_nowait()
+            except queue.Empty:
+                self.root.after(100, poll)
+                return
+            self.folder_discovery_running = False
+            progress.stop()
+            progress_window.destroy()
+            if error:
+                messagebox.showerror(
+                    "Folder import failed",
+                    f"I could not read this folder.\n\n{error}\n\nCrash details saved at:\n{self.crash_log_path()}"
+                )
+                return
+            if not supported:
+                report_path = self.write_import_report(0, skipped)
+                messagebox.showinfo(
+                    "No supported books found",
+                    f"No supported ebook or document files were found in that folder.\n\nReport saved at:\n{report_path}"
+                )
+                return
+            if len(supported) > 1 and messagebox.askyesno(
+                "One book in multiple parts?",
+                "Does this folder contain one book split into multiple part files?\n\n"
+                "Choose Yes to combine the files into one EPUB and add one book to the library. "
+                "Choose No to import each file as a separate book."
+            ):
+                self.start_combined_folder_import(
+                    root_folder, sorted(supported, key=book_part_sort_key), default_source, skipped
+                )
+                return
+            if messagebox.askyesno(
+                "Confirm folder import",
+                f"Found {len(supported)} supported file{'s' if len(supported) != 1 else ''}. Import them now?"
+            ):
+                self.start_folder_import(supported, default_source, skipped)
+
+        self.status_var.set("Searching the selected folder for books.")
+        threading.Thread(target=worker, daemon=True, name="folder-discovery").start()
+        self.root.after(100, poll)
+
+    def start_folder_import(self, paths, default_source, skipped_items):
+        if self.folder_import_running:
+            return
+        self.folder_import_running = True
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Importing Books")
+        progress_window.transient(self.root)
+        progress_window.resizable(False, False)
+        progress_window.protocol("WM_DELETE_WINDOW", lambda: None)
+        message_var = StringVar(value="Preparing folder import.")
+        ttk.Label(progress_window, textvariable=message_var, padding=12).pack(fill=X)
+        progress = ttk.Progressbar(progress_window, mode="determinate", maximum=max(1, len(paths)), length=360)
+        progress.pack(fill=X, padx=12, pady=(0, 12))
+        events = queue.Queue()
+
+        def worker():
+            imported = 0
+            skipped = list(skipped_items)
+            database = None
+            try:
+                database = LibraryDatabase()
+                for index, path in enumerate(paths, start=1):
+                    events.put(("progress", index, len(paths), path.name))
+                    try:
+                        if path.suffix.lower() == ".zip":
+                            zip_imported, zip_skipped = self.import_zip_file_without_prompt(
+                                path, default_source=default_source, database=database
+                            )
+                            imported += zip_imported
+                            skipped.extend(zip_skipped)
+                        elif self.import_one_book_without_prompt(path, default_source=default_source, database=database):
+                            imported += 1
+                        else:
+                            skipped.append(f"{path} -- unsupported or not imported")
+                    except sqlite3.IntegrityError as exc:
+                        skipped.append(f"{path} -- already imported or duplicate stored path")
+                        logger.warning("Duplicate during folder import: %s", path, exc_info=exc)
+                    except Exception as exc:
+                        skipped.append(f"{path} -- {exc}")
+                        logger.exception("Importing file failed: %s", path)
+                report_path = self.write_import_report(imported, skipped)
+                events.put(("done", imported, skipped, report_path, ""))
+            except Exception as exc:
+                logger.exception("Background folder import failed")
+                events.put(("done", imported, skipped, "", str(exc)))
+            finally:
+                if database is not None:
+                    database.close()
+
+        def poll():
+            try:
+                while True:
+                    event = events.get_nowait()
+                    if event[0] == "progress":
+                        _kind, index, total, name = event
+                        progress.configure(value=index)
+                        message = f"Importing {index} of {total}: {name}"
+                        message_var.set(message)
+                        self.status_var.set(message)
+                    else:
+                        _kind, imported, skipped, report_path, error = event
+                        self.folder_import_running = False
+                        progress_window.destroy()
+                        if error:
+                            messagebox.showerror("Folder import failed", f"{error}\n\nCrash details saved at:\n{self.crash_log_path()}")
+                            return
+                        self.refresh_books()
+                        if imported:
+                            self.focus_books_list()
+                        count = len(skipped)
+                        messagebox.showinfo(
+                            "Folder import complete",
+                            f"Imported {imported} book{'s' if imported != 1 else ''}. "
+                            f"Skipped {count} file{'s' if count != 1 else ''}.\n\n"
+                            f"Import report saved at:\n{report_path}",
+                        )
+                        self.status_var.set(f"Folder import complete. Imported {imported}. Skipped {count}.")
+                        return
+            except queue.Empty:
+                pass
+            if self.folder_import_running:
+                self.root.after(100, poll)
+
+        threading.Thread(target=worker, daemon=True, name="folder-import").start()
+        self.root.after(100, poll)
 
     def start_combined_folder_import(self, root_folder: Path, parts: list[Path], default_source: str, skipped_items: list[str]):
         progress_window = tk.Toplevel(self.root)
@@ -4914,6 +5961,8 @@ class LibraryApp:
         initial_metadata = {
             "title": clean_filename_title(root_folder),
             "author": "",
+            "series": "",
+            "series_number": "",
             "edition": "",
             "year": "",
             "isbn": "",
@@ -4949,9 +5998,134 @@ class LibraryApp:
             metadata.get("isbn", ""),
             metadata.get("publisher", ""),
         )
+        self.db.update_series_fields(new_book_id, metadata.get("series", ""), metadata.get("series_number", ""))
         self.update_accessibility_from_epub(new_book_id, destination)
         self.queue_book_for_indexing(new_book_id, str(destination))
         return 1
+
+    def combine_selected_books_to_epub(self):
+        book_ids = self.selected_book_ids()
+        if len(book_ids) < 2:
+            messagebox.showinfo(
+                "Select Multiple Books",
+                "Select at least two book parts first. Use Control+Space on each book part, then run this command again."
+            )
+
+            return
+
+        rows = [self.db.get_book(book_id) for book_id in book_ids]
+        rows = [row for row in rows if row]
+        if len(rows) < 2:
+            messagebox.showinfo("Select Multiple Books", "I could not find at least two selected books to combine.")
+            return
+
+        if not messagebox.askyesno(
+            "Combine Selected Books",
+            f"Combine {len(rows)} selected books into one EPUB using the current list order?\n\n"
+            "The original library entries will be kept unless you choose to remove them after the combined EPUB is created."
+        ):
+            return
+
+        readable_parts = []
+        combined_sample = []
+        skipped = []
+        for row in rows:
+            stored_path = Path(row[8])
+            if not stored_path.exists():
+                skipped.append(f"{row[1]} -- stored file not found")
+                continue
+            if stored_path.suffix.lower() == ".zip":
+                skipped.append(f"{row[1]} -- ZIP files cannot be combined into one EPUB")
+                continue
+            text = read_text_for_metadata_detection(stored_path, max_chars=250000)
+            if not text.strip():
+                skipped.append(f"{row[1]} -- no readable text found")
+                continue
+            readable_parts.append((stored_path, text))
+            if len(" ".join(combined_sample)) < 50000:
+                combined_sample.append(text[:10000])
+
+        if len(readable_parts) < 2:
+            report_path = self.write_import_report(0, skipped)
+            messagebox.showerror(
+                "Could Not Combine Books",
+                f"I found readable text in fewer than two selected books.\n\nReport saved at:\n{report_path}"
+            )
+            return
+
+        authors = {row[2].strip() for row in rows if row[2].strip()}
+        sources = {row[3].strip() for row in rows if row[3].strip()}
+        first_row = rows[0]
+        initial_metadata = {
+            "title": first_row[1] or "Combined Book",
+            "author": next(iter(authors)) if len(authors) == 1 else "",
+            "series": first_row[21] if len(first_row) > 21 else "",
+            "series_number": first_row[22] if len(first_row) > 22 else "",
+            "edition": "",
+            "year": "",
+            "isbn": "",
+            "publisher": "",
+            "source": next(iter(sources)) if len(sources) == 1 else "",
+            "tags": "",
+            "notes": "Combined from selected library books.",
+        }
+        detected = detect_metadata_from_text_content("\n".join(combined_sample), existing=initial_metadata)
+        initial_metadata.update({key: value for key, value in detected.items() if value})
+
+        metadata = TkMetadataDialog.ask(self.root, "Combined Book Metadata", initial_metadata)
+        if not metadata:
+            return
+
+        output_name = safe_filename(f"{metadata['author']} - {metadata['title']}").strip(" -") or safe_filename(metadata["title"])
+        destination = self.unique_destination(output_name, ".epub")
+        self.create_combined_epub(destination, readable_parts, metadata, root_folder=None)
+
+        original_note = "Combined selected library books: " + ", ".join(str(row[0]) for row in rows)
+        new_book_id = self.db.add_book(
+            metadata["title"],
+            metadata["author"],
+            metadata["source"],
+            metadata["tags"],
+            metadata["notes"],
+            original_note,
+            str(destination),
+        )
+        self.db.update_extra_fields(
+            new_book_id,
+            metadata.get("edition", ""),
+            metadata.get("year", ""),
+            metadata.get("isbn", ""),
+            metadata.get("publisher", ""),
+        )
+        self.db.update_series_fields(new_book_id, metadata.get("series", ""), metadata.get("series_number", ""))
+        self.update_accessibility_from_epub(new_book_id, destination)
+        self.queue_book_for_indexing(new_book_id, str(destination))
+
+        removed_parts = 0
+        if messagebox.askyesno(
+            "Remove Original Part Entries?",
+            "The combined EPUB was created. Remove the original selected part entries from the library list?\n\n"
+            "Their stored files will not be deleted."
+        ):
+            for row in rows:
+                try:
+                    self.db.delete_book(row[0], delete_file=False)
+                    self.marked_book_ids.discard(row[0])
+                    removed_parts += 1
+                except Exception as exc:
+                    skipped.append(f"{row[1]} -- could not remove original entry: {exc}")
+
+        self.refresh_books(selected_book_id=new_book_id)
+        self.focus_books_list()
+        report_path = self.write_import_report(1, skipped) if skipped else None
+        message = (
+            f"Created one combined EPUB from {len(readable_parts)} selected book parts.\n\n"
+            f"Removed {removed_parts} original part entr{'y' if removed_parts == 1 else 'ies'} from the library list."
+        )
+        if report_path:
+            message += f"\n\nReport saved at:\n{report_path}"
+        messagebox.showinfo("Combined EPUB Created", message)
+        self.status_var.set("Combined selected books into one EPUB.")
 
     def create_combined_epub(self, destination: Path, readable_parts, metadata, root_folder: Path | None = None):
         book_uuid = f"urn:uuid:{uuid.uuid4()}"
@@ -4962,7 +6136,7 @@ class LibraryApp:
         isbn = metadata.get("isbn", "") or ""
         combined_text = "\n".join(text for _part_path, text in readable_parts)
         language = detect_language_from_text(combined_text, default="en")
-        modified = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        modified = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ")
         chapters = []
         text_toc_entries = parse_text_toc_entries(combined_text)
         source_note_parts = []
@@ -5106,7 +6280,7 @@ class LibraryApp:
 
             if looks_like_standalone_heading_line(line) or (previous_output_was_heading and looks_like_heading_continuation_line(line)):
                 flush_paragraph()
-                if re.match(r"^(?:chapter|part|section|appendix|index|front matter|Â§|Ã‚Â§)", line, flags=re.IGNORECASE) or previous_output_was_heading:
+                if re.match(r"^(?:chapter|part|section|appendix|index|front matter|\u00a7)", line, flags=re.IGNORECASE) or previous_output_was_heading:
                     output.append(f"    <h2>{html.escape(line)}</h2>")
                     previous_output_was_heading = True
                 else:
@@ -5268,6 +6442,7 @@ class LibraryApp:
                 metadata.get("isbn", ""),
                 metadata.get("publisher", ""),
             )
+            self.db.update_series_fields(new_book_id, metadata.get("series", ""), metadata.get("series_number", ""))
             self.update_accessibility_from_epub(new_book_id, destination)
             self.queue_book_for_indexing(new_book_id, str(destination))
             added += 1
@@ -5285,6 +6460,72 @@ class LibraryApp:
             number += 1
         return candidate
 
+    def repair_backup_files(self):
+        backup_suffixes = (
+            ".bak",
+            ".before_pagebreaks.bak",
+            ".before_toc_rebuild.bak",
+            ".before_text_cleanup.bak",
+        )
+        try:
+            candidates = [
+                path for path in self.db.books_path.rglob("*")
+                if path.is_file() and any(path.name.lower().endswith(suffix) for suffix in backup_suffixes)
+            ]
+        except Exception as exc:
+            self.log_error("Listing repair backup files", exc)
+            return []
+        return sorted(candidates, key=lambda path: str(path).casefold())
+
+    def remove_repair_backup_files(self):
+        backups = self.repair_backup_files()
+        if not backups:
+            self.status_var.set("No repair backup files found.")
+            messagebox.showinfo(
+                "No Backup Files Found",
+                "No repair backup files were found in the managed Books folder."
+            )
+            return
+
+        total_bytes = 0
+        for path in backups:
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                pass
+
+        if not messagebox.askyesno(
+            "Remove Repair Backup Files",
+            f"Remove {len(backups)} repair backup file{'s' if len(backups) != 1 else ''} from the managed Books folder?\n\n"
+            f"Total size: {format_byte_count(total_bytes)}\n\n"
+            "This only removes files whose names end in .bak, .before_pagebreaks.bak, .before_toc_rebuild.bak, or .before_text_cleanup.bak."
+        ):
+            return
+
+        removed = 0
+        skipped = []
+        for path in backups:
+            try:
+                path.unlink()
+                removed += 1
+            except Exception as exc:
+                skipped.append(f"{path} -- {exc}")
+
+        if skipped:
+            report_path = self.write_import_report(removed, skipped)
+            messagebox.showwarning(
+                "Backup Cleanup Finished With Warnings",
+                f"Removed {removed} backup file{'s' if removed != 1 else ''}. "
+                f"Could not remove {len(skipped)} file{'s' if len(skipped) != 1 else ''}.\n\n"
+                f"Report saved at:\n{report_path}"
+            )
+        else:
+            messagebox.showinfo(
+                "Backup Cleanup Complete",
+                f"Removed {removed} backup file{'s' if removed != 1 else ''}."
+            )
+        self.status_var.set(f"Removed {removed} repair backup file{'s' if removed != 1 else ''}.")
+
     def row_to_metadata(self, row):
         return {
             "title": row[1],
@@ -5293,6 +6534,8 @@ class LibraryApp:
             "year": row[11],
             "isbn": row[12],
             "publisher": row[13],
+            "series": row[21] if len(row) > 21 else "",
+            "series_number": row[22] if len(row) > 22 else "",
             "source": row[3],
             "tags": row[4],
             "notes": row[5],
@@ -5307,7 +6550,7 @@ class LibraryApp:
 
     def merge_online_metadata(self, existing, online, replace_existing=False):
         merged = dict(existing)
-        for key in ["title", "author", "edition", "year", "isbn", "publisher", "tags", "notes", "cover_url"]:
+        for key in ["title", "author", "series", "series_number", "edition", "year", "isbn", "publisher", "tags", "notes", "cover_url"]:
             incoming = (online.get(key, "") or "").strip()
             if not incoming:
                 continue
@@ -5330,6 +6573,11 @@ class LibraryApp:
             metadata.get("year", ""),
             metadata.get("isbn", ""),
             metadata.get("publisher", ""),
+        )
+        self.db.update_series_fields(
+            book_id,
+            metadata.get("series", ""),
+            metadata.get("series_number", ""),
         )
         if metadata.get("cover_url"):
             self.db.update_cover_url(book_id, metadata.get("cover_url", ""))
@@ -5379,6 +6627,8 @@ class LibraryApp:
             "Detected metadata:\n\n"
             f"Title: {detected.get('title', '')}\n"
             f"Author: {detected.get('author', '')}\n"
+            f"Series: {detected.get('series', '')}\n"
+            f"Series number: {detected.get('series_number', '')}\n"
             f"Edition: {detected.get('edition', '')}\n"
             f"Year: {detected.get('year', '')}\n"
             f"ISBN: {detected.get('isbn', '')}\n"
@@ -5399,6 +6649,46 @@ class LibraryApp:
         self.update_accessibility_from_epub(book_id, row[8])
         self.refresh_books(selected_book_id=book_id)
         self.focus_books_list()
+
+    def bulk_edit_selected_metadata(self):
+        book_ids = self.selected_book_ids()
+        if not book_ids:
+            return
+        if len(book_ids) < 2:
+            if not messagebox.askyesno(
+                "Only One Book Selected",
+                "Only one book is selected. Continue with bulk metadata edit for this one book?"
+            ):
+                return
+        metadata = BulkMetadataDialog.ask(self.root)
+        if not metadata:
+            return
+        updates = {
+            key: value.strip()
+            for key, value in metadata.items()
+            if key in {
+                "author", "source", "tags", "notes", "edition", "year",
+                "publisher", "series",
+            }
+            and value.strip()
+        }
+        if not updates:
+            messagebox.showinfo("No Changes", "No fields were entered, so no books were changed.")
+            return
+        summary = "\n".join(f"{key.replace('_', ' ').title()}: {value}" for key, value in updates.items())
+        if not messagebox.askyesno(
+            "Apply Bulk Metadata",
+            f"Apply these metadata changes to {len(book_ids)} selected book{'s' if len(book_ids) != 1 else ''}?\n\n{summary}"
+        ):
+            return
+        changed = self.db.update_bulk_metadata_fields(book_ids, updates)
+        self.refresh_books(selected_book_id=book_ids[0])
+        self.focus_books_list()
+        self.status_var.set(f"Bulk metadata updated for {changed} book{'s' if changed != 1 else ''}.")
+        messagebox.showinfo(
+            "Bulk Metadata Updated",
+            f"Updated {changed} book{'s' if changed != 1 else ''}."
+        )
 
     def check_selected_epub_accessibility(self):
         book_id = self.selected_book_id()
@@ -5428,6 +6718,71 @@ class LibraryApp:
             "EPUB Accessibility Metadata",
             text if metadata else "No accessibility metadata could be checked for this EPUB."
         )
+
+    def cleanup_repair_wizard(self):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return
+        stored_path = Path(row[8])
+        if stored_path.suffix.lower() != ".epub":
+            messagebox.showinfo("EPUB only", "The cleanup and repair wizard currently works on EPUB books.")
+            return
+        if not stored_path.exists():
+            messagebox.showerror("Book file missing", "The stored EPUB file could not be found.")
+            return
+
+        if not messagebox.askyesno(
+            "Cleanup and Repair Wizard",
+            f"Run the cleanup and repair wizard for:\n\n{row[1]}\n\n"
+            "The wizard can check accessibility metadata, clean repeated text, add page breaks, and rebuild the table of contents. "
+            "Backup copies are made before EPUB file repairs.\n\nContinue?"
+        ):
+            return
+
+        run_accessibility = messagebox.askyesno("Wizard Step", "Check EPUB accessibility metadata?")
+        run_clean = messagebox.askyesno("Wizard Step", "Clean repeated headers, footers, blank-page notices, language metadata, and page labels?")
+        run_pages = False if run_clean else messagebox.askyesno("Wizard Step", "Add EPUB page breaks from written page labels?")
+        run_toc = messagebox.askyesno("Wizard Step", "Rebuild the EPUB table of contents from a text table of contents?")
+
+        results = []
+        try:
+            if run_accessibility:
+                metadata = self.update_accessibility_from_epub(book_id, stored_path)
+                results.append("Accessibility metadata checked." if metadata else "No accessibility metadata was found.")
+            if run_clean:
+                changed = self.clean_epub_text_file(stored_path)
+                results.append(f"Text cleanup made {changed} change{'s' if changed != 1 else ''}.")
+            if run_pages:
+                inserted = self.add_page_breaks_to_epub_file(stored_path)
+                results.append(f"Added {inserted} page-break marker{'s' if inserted != 1 else ''}.")
+            if run_toc:
+                inserted = self.add_page_breaks_to_epub_file(stored_path)
+                added, skipped = self.rebuild_epub_toc_from_text(stored_path)
+                results.append(
+                    f"Before TOC rebuild, added {inserted} page-break marker{'s' if inserted != 1 else ''}. "
+                    f"Built {added} TOC item{'s' if added != 1 else ''}; skipped {skipped}."
+                )
+            if run_clean or run_pages or run_toc:
+                self.update_accessibility_from_epub(book_id, stored_path)
+        except Exception as exc:
+            self.log_error("Cleanup and repair wizard", exc)
+            messagebox.showerror(
+                "Cleanup Wizard Failed",
+                f"The cleanup wizard could not finish.\n\n{exc}\n\nCrash details saved at:\n{self.crash_log_path()}"
+            )
+            return
+
+        if not results:
+            results.append("No wizard steps were selected.")
+        self.refresh_books(selected_book_id=book_id)
+        self.focus_books_list()
+        text = "\n".join(results)
+        self.status_var.set("Cleanup and repair wizard complete.")
+        messagebox.showinfo("Cleanup and Repair Complete", text)
 
     def add_page_breaks_to_selected_epub(self):
         book_id = self.selected_book_id()
@@ -5898,6 +7253,8 @@ class LibraryApp:
             f"Found metadata from {service}:\n\n"
             f"Title: {online.get('title', '')}\n"
             f"Author: {online.get('author', '')}\n"
+            f"Series: {online.get('series', '')}\n"
+            f"Series number: {online.get('series_number', '')}\n"
             f"Edition: {online.get('edition', '')}\n"
             f"Year: {online.get('year', '')}\n"
             f"ISBN: {online.get('isbn', '')}\n"
@@ -5930,22 +7287,12 @@ class LibraryApp:
 
         cover_url = row[14] if len(row) > 14 else ""
         if not cover_url:
-            if not messagebox.askyesno(
-                "No cover saved",
-                "No cover image is saved for this book yet. Look online now?"
-            ):
+            if not self.find_cover_for_selected_book(confirm=True):
                 return
-            try:
-                online, service = lookup_online_metadata(self.row_to_metadata(row))
-            except Exception as exc:
-                messagebox.showerror("Cover lookup failed", f"Could not look up a cover image online.\n\n{exc}")
-                return
-            cover_url = online.get("cover_url", "")
+            updated_row = self.db.get_book(book_id)
+            cover_url = updated_row[14] if updated_row and len(updated_row) > 14 else ""
             if not cover_url:
-                messagebox.showinfo("No cover found", "No cover image was found online for this book.")
                 return
-            self.db.update_cover_url(book_id, cover_url)
-            self.status_var.set(f"Cover image found from {service}.")
 
         try:
             import webbrowser
@@ -5953,6 +7300,39 @@ class LibraryApp:
             self.status_var.set("Opened cover image.")
         except Exception as exc:
             messagebox.showerror("Open cover failed", f"Could not open the cover image.\n\n{exc}")
+
+    def find_cover_for_selected_book(self, confirm=False):
+        book_id = self.selected_book_id()
+        if book_id is None:
+            return False
+
+        row = self.db.get_book(book_id)
+        if not row:
+            messagebox.showerror("Book not found", "The selected book was not found.")
+            return False
+
+        if confirm and not messagebox.askyesno(
+            "No cover saved",
+            "No cover image is saved for this book yet. Look online now?"
+        ):
+            return False
+
+        try:
+            online, service = lookup_online_metadata(self.row_to_metadata(row))
+        except Exception as exc:
+            messagebox.showerror("Cover lookup failed", f"Could not look up a cover image online.\n\n{exc}")
+            return False
+
+        cover_url = online.get("cover_url", "")
+        if not cover_url:
+            messagebox.showinfo("No cover found", "No cover image was found online for this book.")
+            self.status_var.set("No cover image found.")
+            return False
+
+        self.db.update_cover_url(book_id, cover_url)
+        self.status_var.set(f"Cover image found from {service}.")
+        self.schedule_cover_preview_update(book_id)
+        return True
 
     def edit_book(self, initial_focus_field="title"):
         book_id = self.selected_book_id()
@@ -5971,6 +7351,8 @@ class LibraryApp:
                 {
                     "title": row[1],
                     "author": row[2],
+                    "series": row[21] if len(row) > 21 else "",
+                    "series_number": row[22] if len(row) > 22 else "",
                     "edition": row[10],
                     "year": row[11],
                     "isbn": row[12],
@@ -6007,6 +7389,11 @@ class LibraryApp:
             metadata.get("year", ""),
             metadata.get("isbn", ""),
             metadata.get("publisher", ""),
+        )
+        self.db.update_series_fields(
+            book_id,
+            metadata.get("series", ""),
+            metadata.get("series_number", ""),
         )
 
         stored_path = Path(row[8])
@@ -6098,8 +7485,8 @@ class LibraryApp:
                 "I could not find Kindle for PC. Install Kindle for PC, then try again."
             )
 
-    def calibre_metadata_reading_enabled(self):
-        db = getattr(self, "db", None)
+    def calibre_metadata_reading_enabled(self, database=None):
+        db = database or getattr(self, "db", None)
         if db is None or not hasattr(db, "get_setting"):
             return True
         return db.get_setting("calibre_metadata_reading", "1") != "0"
@@ -6197,6 +7584,11 @@ class LibraryApp:
 
         new_book_id = self.db.add_book(row[1], row[2], row[3], row[4], row[5], str(source_file), str(output_path))
         self.db.update_extra_fields(new_book_id, row[10], row[11], row[12], row[13])
+        self.db.update_series_fields(
+            new_book_id,
+            row[21] if len(row) > 21 else "",
+            row[22] if len(row) > 22 else "",
+        )
         self.update_accessibility_from_epub(new_book_id, output_path)
         self.queue_book_for_indexing(new_book_id, str(output_path))
         self.refresh_books()
@@ -6929,6 +8321,60 @@ catch {
             setting_key="dolphin_easyreader_folder",
         )
 
+    def copy_batch_to_folder(self, rows, destination_folder):
+        planned_names = set()
+        destinations = []
+        for row in rows:
+            source = Path(row[8])
+            if not source.exists():
+                destinations.append((row, source, None, "stored file missing"))
+                continue
+
+            destination = destination_folder / source.name
+            key = destination.name.casefold()
+            if key in planned_names:
+                base = safe_filename(f"{row[2]} - {row[1]}").strip(" -") or safe_filename(row[1])
+                destination = destination_folder / f"{base}{source.suffix}"
+                suffix = 2
+                while destination.name.casefold() in planned_names:
+                    destination = destination_folder / f"{base} ({suffix}){source.suffix}"
+                    suffix += 1
+            planned_names.add(destination.name.casefold())
+            try:
+                if source.resolve() == destination.resolve():
+                    destinations.append((row, source, None, "source and destination are the same file"))
+                    continue
+            except OSError:
+                pass
+            destinations.append((row, source, destination, ""))
+
+        existing = [destination for _row, _source, destination, error in destinations if destination and destination.exists()]
+        replace_existing = False
+        if existing:
+            preview = "\n".join(path.name for path in existing[:10])
+            if len(existing) > 10:
+                preview += f"\nAnd {len(existing) - 10} more."
+            replace_existing = messagebox.askyesno(
+                "Replace existing files?",
+                f"{len(existing)} destination file(s) already exist. Replace those files?\n\n{preview}",
+            )
+
+        copied = 0
+        skipped = []
+        for row, source, destination, error in destinations:
+            if error:
+                skipped.append(f"{row[1]}: {error}")
+                continue
+            if destination.exists() and not replace_existing:
+                skipped.append(f"{row[1]}: skipped because {destination.name} already exists")
+                continue
+            try:
+                shutil.copy2(source, destination)
+                copied += 1
+            except Exception as exc:
+                skipped.append(f"{row[1]}: {exc}")
+        return copied, skipped
+
     def copy_selected_books_to_folder_target(self, app_name, folder_name, folder_getter, setting_key):
         book_ids = self.selected_book_ids()
         if not book_ids:
@@ -6953,29 +8399,7 @@ catch {
             self.db.set_setting(setting_key, "")
             return
 
-        sent = 0
-        skipped = []
-        for row in rows:
-            source = Path(row[8])
-            if not source.exists():
-                skipped.append(f"{row[1]}: stored file missing")
-                continue
-
-            destination = destination_folder / source.name
-            if destination.exists():
-                replace = messagebox.askyesno(
-                    "Replace existing file",
-                    f"{destination.name} already exists in the {folder_name}. Replace it?"
-                )
-                if not replace:
-                    skipped.append(f"{row[1]}: skipped because the file already exists")
-                    continue
-
-            try:
-                shutil.copy2(source, destination)
-                sent += 1
-            except Exception as exc:
-                skipped.append(f"{row[1]}: {exc}")
+        sent, skipped = self.copy_batch_to_folder(rows, destination_folder)
 
         self.status_var.set(f"Sent {sent} book{'s' if sent != 1 else ''} to {app_name}.")
         if skipped:
@@ -7004,23 +8428,14 @@ catch {
         if not folder:
             return
 
-        exported = 0
-        skipped = []
-        for row in rows:
-            source = Path(row[8])
-            if not source.exists():
-                skipped.append(f"{row[1]}: stored file missing")
-                continue
-            destination = Path(folder) / source.name
-            if destination.exists():
-                if not messagebox.askyesno("Replace file", f"{destination.name} already exists. Replace it?"):
-                    skipped.append(f"{row[1]}: skipped because the export file already exists")
-                    continue
-            try:
-                shutil.copy2(source, destination)
-                exported += 1
-            except Exception as exc:
-                skipped.append(f"{row[1]}: {exc}")
+        export_format = self.choose_export_format()
+        if export_format is None:
+            return
+
+        if export_format == "epub":
+            exported, skipped = self.export_batch_as_epub(rows, Path(folder))
+        else:
+            exported, skipped = self.copy_batch_to_folder(rows, Path(folder))
 
         self.status_var.set(f"Exported {exported} book{'s' if exported != 1 else ''}.")
         if skipped:
@@ -7031,6 +8446,132 @@ catch {
             )
         else:
             messagebox.showinfo("Export complete", f"Exported {exported} book{'s' if exported != 1 else ''}.")
+
+    def choose_export_format(self):
+        result = {"format": None}
+        window = tk.Toplevel(self.root)
+        window.title("Export Format")
+        window.transient(self.root)
+        window.grab_set()
+
+        main = ttk.Frame(window, padding=12)
+        main.pack(fill=BOTH, expand=True)
+        ttk.Label(
+            main,
+            text="Choose the format for the exported book copies. The originals in your library will not be changed.",
+            wraplength=500,
+        ).pack(anchor="w", pady=(0, 8))
+
+        format_var = StringVar(value="original")
+        ttk.Radiobutton(
+            main,
+            text="Keep original format",
+            variable=format_var,
+            value="original",
+        ).pack(anchor="w", pady=3)
+        ttk.Radiobutton(
+            main,
+            text="Convert exported copies to EPUB",
+            variable=format_var,
+            value="epub",
+        ).pack(anchor="w", pady=3)
+
+        buttons = ttk.Frame(main)
+        buttons.pack(anchor="e", pady=(10, 0))
+
+        def accept():
+            result["format"] = format_var.get()
+            window.destroy()
+
+        ttk.Button(buttons, text="Export", command=accept).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side=LEFT)
+        window.bind("<Return>", lambda _event: accept())
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+
+        def focus_choice():
+            window.lift()
+            window.focus_force()
+            for child in main.winfo_children():
+                if isinstance(child, ttk.Radiobutton):
+                    child.focus_force()
+                    break
+
+        window.after(50, focus_choice)
+        window.after(200, focus_choice)
+        self.root.wait_window(window)
+        return result["format"]
+
+    def export_batch_as_epub(self, rows, destination_folder):
+        needs_conversion = any(
+            row and Path(row[8]).suffix.lower() != ".epub" and Path(row[8]).exists()
+            for row in rows
+        )
+        converter = self.find_ebook_convert() if needs_conversion else None
+        if needs_conversion and not converter:
+            messagebox.showerror(
+                "Calibre not found",
+                "I could not find Calibre's ebook-convert tool. Install Calibre to export books as EPUB.",
+            )
+            return 0, ["EPUB export was not started because Calibre could not be found."]
+
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        exported = 0
+        skipped = []
+        planned = set()
+        for row in rows:
+            source = Path(row[8])
+            if not source.exists():
+                skipped.append(f"{row[1]}: stored book file is missing")
+                continue
+
+            base_name = safe_filename(f"{row[2]} - {row[1]}").strip(" -") or safe_filename(row[1])
+            output_path = destination_folder / f"{base_name}.epub"
+            suffix = 2
+            while output_path.exists() or output_path.name.casefold() in planned:
+                output_path = destination_folder / f"{base_name} ({suffix}).epub"
+                suffix += 1
+            planned.add(output_path.name.casefold())
+
+            if source.suffix.lower() == ".epub":
+                try:
+                    shutil.copy2(source, output_path)
+                    exported += 1
+                except Exception as exc:
+                    skipped.append(f"{row[1]}: {exc}")
+                continue
+
+            command = [converter, str(source), str(output_path), "--title", row[1]]
+            if row[2]:
+                command.extend(["--authors", row[2]])
+            if row[4]:
+                command.extend(["--tags", row[4]])
+            self.status_var.set(f"Converting {row[1]} to EPUB for export.")
+            self.root.update_idletasks()
+            try:
+                completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=300)
+                if completed.returncode != 0 or not output_path.exists():
+                    details = completed.stderr.strip() or completed.stdout.strip() or "Conversion did not create an EPUB file."
+                    skipped.append(f"{row[1]}: {details[:500]}")
+                    try:
+                        output_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    continue
+                try:
+                    write_epub_metadata(output_path, row[1], row[2], row[3], row[4], row[5])
+                except Exception:
+                    pass
+                exported += 1
+            except subprocess.TimeoutExpired:
+                skipped.append(f"{row[1]}: conversion timed out")
+                try:
+                    output_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            except Exception as exc:
+                skipped.append(f"{row[1]}: {exc}")
+        return exported, skipped
 
     def delete_book(self):
         book_ids = self.selected_book_ids()
@@ -7072,13 +8613,16 @@ catch {
             "Control+N: Add book.\n"
             "Control+Shift+N: Import a folder of books, including Bookshare ZIP files.\n"
             "F2: Edit selected book metadata. On Windows, the metadata editor uses native edit boxes so screen readers can read field names, contents, and typed text. Use Tab and Shift+Tab to move between fields.\n"
+            "Use Book, Bulk Edit Selected Metadata, to apply author, series, edition, year, ISBN, publisher, source, tags, or notes to selected books. Blank fields are left unchanged.\n"
             "Control+D: Auto-detect metadata from the selected book.\n"
+            "Use Book, Repair, Cleanup and Repair Wizard, to run common EPUB checks and repairs from one guided flow.\n"
             "Use Book, Repair, Check EPUB Accessibility Metadata, to inspect the selected EPUB for package accessibility metadata, navigation, page list, heading structure, language, and image alt text coverage.\n"
             "Use Book, Repair, Add EPUB Page Breaks from Page Labels, to repair an already-imported EPUB that has written page labels like Page 277 or age 277 but no real page-break markers.\n"
             "Use Book, Repair, Rebuild EPUB Table of Contents from Text TOC, to align EPUB navigation with a text table of contents when page-break anchors are available.\n"
             "Use Book, Repair, Clean Repaired EPUB Text, to remove obvious repeated headers or footers, remove blank-page notices, auto-detect missing language metadata, and add page breaks from page labels.\n"
+            "Use Book, Repair, Combine Selected Books into One EPUB, to combine selected part-books into a new EPUB in the current list order.\n"
             "Use the Book menu, Look Up Book Metadata from Internet, to search Open Library and Google Books for metadata.\n"
-            "Use the Book menu, View Cover Image, to open a visual cover image when one is available or look one up online.\n"
+            "Use the Book menu, View Cover Image, to open a visual cover image when one is available or look one up online. The cover preview beside the book list is visual only and does not change book list speech.\n"
             "Enter or Control+O: Open selected book.\n"
             "Control+E: Export selected book.\n"
             "Control+R: Convert selected book to EPUB.\n"
@@ -7096,10 +8640,12 @@ catch {
             "Escape: Clear the current search and return to the full book list.\n"
             "Home and End: Move to the first or last shown book.\n"
             "Control+I: Show book details.\n"
-            "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads edition, Alt+4 reads year, Alt+5 reads ISBN, Alt+6 reads publisher, Alt+7 reads source, Alt+8 reads tags, Alt+9 reads format, and Alt+0 reads date added. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
-            "Use Organize, Sort, to sort title or author A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
+            "In the books list, Alt+1 reads title, Alt+2 reads author, Alt+3 reads series, Alt+4 reads series number, Alt+5 reads edition, Alt+6 reads year, Alt+7 reads ISBN, Alt+8 reads publisher, Alt+9 reads source, and Alt+0 reads tags. Press the same Alt+number twice quickly to edit that field when it is editable.\n"
+            "Use Organize, Sort, to sort title, author, or series A to Z or Z to A, and to sort published year or date added newest to oldest or oldest to newest.\n"
             "Use Organize, Filter, to filter by source, tag, or format, or to clear filters.\n"
+            "Use Organize, Saved Views, to open built-in views like Missing Metadata, Recently Added, EPUB Books, and Bookshare Books, or to save and reopen your current search/filter/sort view.\n"
             "Use Organize, Remove Duplicates Prefer EPUB, to remove likely duplicate library entries while keeping an EPUB version when one exists.\n"
+            "Use Organize, Toggle Automatic Duplicate Cleanup, to turn startup and periodic duplicate cleanup on or off. Automatic cleanup removes duplicate library entries only, not book files.\n"
             "Use Settings, Book List Reading, to choose title only, title and author, title author and edition, or all details.\n"
             "Use Settings, Missing Metadata Alert Sound, to choose whether the alert means missing author only, missing useful textbook details, or more complete metadata.\n"
             "Use Settings, Library Backup, to choose a Google Drive, OneDrive, iCloud Drive, or other synced folder for database and imported book file backups. You can back up on demand, daily, weekly, or monthly, and restore from the cloud backup if the local library is lost.\n"

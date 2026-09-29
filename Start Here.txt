@@ -1,0 +1,21 @@
+ACCESSIBLE EBOOK LIBRARY MANAGER
+
+Open the Accessible Ebook Library Manager shortcut in this folder.
+The application itself is in Application\Accessible Ebook Library Manager.exe.
+
+Documentation contains the Release Testing Checklist and project guides.
+Source contains the application code, automated tests, and bundled braille tools.
+Tools contains the build and maintenance scripts.
+Archive contains previous builds, diagnostics, and test libraries. These were
+moved, not deleted. Archived build scripts are retained as historical records;
+use Tools\Build Application.cmd for future builds.
+Build contains generated working files and document previews, not the app to run.
+
+Your actual library has not moved. It remains in:
+C:\Users\samar\AppData\Roaming\AccessibleEbookLibraryManager
+
+Keep the entire Application folder together, including its _internal folder.
+Do not copy only the EXE when moving or distributing the application.
+
+If you created your own shortcuts to an older build, replace them with the
+shortcut in this folder. The Git repository and history are preserved.

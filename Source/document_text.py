@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import unicodedata
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -243,7 +244,7 @@ def read_text_from_pdf(pdf_path: Path, max_chars: int = 50000) -> str:
 def read_text_for_metadata_detection(path: Path, max_chars: int = 50000) -> str:
     suffix = path.suffix.lower()
     if suffix == ".epub":
-        return read_text_from_epub(path, max_chars=max_chars)
+        return read_text_from_epub_preserve_lines(path, max_chars=max_chars)
     if suffix == ".docx":
         return read_text_from_docx(path, max_chars=max_chars)
     if suffix == ".doc":
@@ -272,8 +273,10 @@ def extract_text_for_indexing(path: Path) -> str:
 
 
 def detect_language_from_text(text: str, default: str = "en") -> str:
-    sample = re.sub(r"[^A-Za-zÃ€-Ã–Ã˜-Ã¶Ã¸-Ã¿' ]+", " ", text or "").casefold()
-    words = re.findall(r"[a-zÃ€-Ã–Ã˜-Ã¶Ã¸-Ã¿']+", sample[:200000])
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    sample = "".join(char for char in decomposed if not unicodedata.combining(char))
+    sample = re.sub(r"[^A-Za-z' ]+", " ", sample).casefold()
+    words = re.findall(r"[a-z']+", sample[:200000])
     if not words:
         return default
 
@@ -282,9 +285,9 @@ def detect_language_from_text(text: str, default: str = "en") -> str:
         "en": {"the", "and", "of", "to", "in", "that", "is", "for", "with", "as", "was", "are", "by", "from", "this"},
         "es": {"el", "la", "los", "las", "de", "que", "y", "en", "un", "una", "por", "con", "para", "es", "del"},
         "fr": {"le", "la", "les", "de", "des", "que", "et", "en", "un", "une", "pour", "avec", "est", "dans", "du"},
-        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "fÃ¼r"},
-        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "Ã¨", "del", "della"},
-        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "Ã©", "do", "da"},
+        "de": {"der", "die", "das", "und", "von", "zu", "den", "mit", "ist", "im", "dem", "ein", "eine", "nicht", "fur"},
+        "it": {"il", "lo", "la", "gli", "le", "di", "che", "e", "un", "una", "per", "con", "del", "della"},
+        "pt": {"o", "a", "os", "as", "de", "que", "e", "em", "um", "uma", "para", "com", "do", "da"},
     }
     scores = {}
     for language, markers in language_markers.items():

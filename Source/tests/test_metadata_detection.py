@@ -1,4 +1,5 @@
 import importlib.util
+import zipfile
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest import TestCase, main
@@ -36,6 +37,66 @@ def detect_for_file(filename, text):
 
 
 class MetadataDetectionTests(TestCase):
+    def test_format_never_generates_a_tag(self):
+        for extension in ("epub", "pdf", "docx", "mobi"):
+            with patch.object(library_manager, "read_text_for_metadata_detection", return_value=""), \
+                    patch.object(library_manager, "read_epub_metadata", return_value={}):
+                result = library_manager.detect_metadata_from_text(Path("Example." + extension))
+                self.assertEqual(result["tags"], "")
+
+    def test_epub_subjects_restricted_to_dropdown_categories(self):
+        result = self.epub_metadata('<dc:subject>EPUB</dc:subject><dc:subject>fiction</dc:subject><dc:subject>Invented category</dc:subject>')
+        self.assertEqual(result["tags"], "Fiction")
+
+    def test_detection_preserves_existing_library_tags(self):
+        with patch.object(library_manager, "read_text_for_metadata_detection", return_value="Subject: EPUB"):
+            result = library_manager.detect_metadata_from_text(Path("Example.txt"), {"tags": "My old category"})
+        self.assertEqual(result["tags"], "My old category")
+
+    def test_byline_and_catalog_author_do_not_invent_source(self):
+        for text in ("The Problem of Evil\nby Peter Vaninwagen\nChapter 1",
+                     "Cataloging in Publication Data The problem of evil / Peter van Inwagen. p. cm. ISBN 123"):
+            result = library_manager.detect_metadata_from_text_content(text)
+            self.assertIn("Peter", result["author"])
+            self.assertEqual(result["source"], "")
+        self.assertEqual(library_manager.clean_author_value("Byron Smith"), "Byron Smith")
+
+    def test_epub_metadata_reader_preserves_author_paragraph(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "test.epub"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("chapter.xhtml", "<html><body><h1>The Problem of Evil</h1><p>by Peter Vaninwagen</p><p>" + "Body text. " * 100 + "</p></body></html>")
+            result = library_manager.detect_metadata_from_text(path)
+            self.assertEqual(result["author"], "Peter Vaninwagen")
+
+    def epub_metadata(self, fields):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "book.epub"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("META-INF/container.xml", '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>')
+                archive.writestr("book.opf", '<package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" unique-identifier="ebook"><metadata>' + fields + '</metadata></package>')
+            return library_manager.read_epub_metadata(path)
+
+    def test_epub_source_print_isbn_is_not_library_source(self):
+        metadata = self.epub_metadata('<dc:title>Is This Anything?</dc:title><dc:source>9781982112691</dc:source><dc:identifier id="ebook">9781982112745</dc:identifier>')
+        self.assertEqual(metadata["source"], "")
+        self.assertEqual(metadata["isbn"], "9781982112745")
+
+    def test_epub_retains_provider_after_source_isbn(self):
+        metadata = self.epub_metadata('<dc:source>urn:isbn:978-1-9821-1269-1</dc:source><dc:source>Bookshare</dc:source><dc:identifier>urn:uuid:1234567890</dc:identifier>')
+        self.assertEqual(metadata["source"], "Bookshare")
+        self.assertEqual(metadata["isbn"], "")
+
+    def test_epub_identifier_prefers_package_isbn(self):
+        metadata = self.epub_metadata('<dc:identifier>9781982112691</dc:identifier><dc:identifier id="ebook">ISBN-13: 978-1-9821-1274-5</dc:identifier>')
+        self.assertEqual(metadata["isbn"], "9781982112745")
+
+    def test_metadata_isbn_checks_whole_value_and_checksum(self):
+        for value in ("Bookshare 9781982112691", "https://example.com/9781982112691", "9781982112692", "1234567890"):
+            self.assertEqual(library_manager.isbn_from_metadata_value(value), "")
+        self.assertEqual(library_manager.isbn_from_metadata_value("ISBN: 0-306-40615-2"), "0306406152")
+        self.assertEqual(library_manager.isbn_from_metadata_value("0-8044-2957-X"), "080442957X")
+
     def test_pdf_rejects_abbreviated_embedded_title(self):
         detected = detect_for_pdf(
             "Contract Law Selected Source Materials Annotated.pdf",
@@ -286,7 +347,7 @@ class MetadataDetectionTests(TestCase):
         self.assertEqual(metadata["publisher"], "Sample Press")
         self.assertEqual(metadata["year"], "2020")
         self.assertEqual(metadata["source"], "Kindle")
-        self.assertIn("Kindle", metadata["tags"])
+        self.assertEqual(metadata["tags"], "")
 
 
 if __name__ == "__main__":

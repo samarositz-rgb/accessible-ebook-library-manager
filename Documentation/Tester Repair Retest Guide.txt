@@ -1,0 +1,115 @@
+ACCESSIBLE EBOOK LIBRARY MANAGER
+TESTER REPAIR RETEST GUIDE
+September 28 2026
+
+Use this shorter guide before repeating the complete release checklist.
+Record your screen reader and version, then Pass, Fail, or Not tested for each
+item. For failures, record the keys pressed and the exact speech if possible.
+Use disposable books for edits and deletion. Keep your verified backup.
+Do not restore a backup over your working library for these tests.
+
+1. FIND THE GOLDEN GATE BOOK
+Press Ctrl+F, type Golden Gate, and press Enter. Search now clears earlier
+category filters and searches the whole library. The Golden Gate Bridge
+should appear. Its library record and stored EPUB were present during our
+read-only diagnostic check. Press Escape to show the unfiltered library.
+Then search for a nonsense phrase. Focus should remain in Search, with a
+brief no-results announcement, not on an old book. Escape restores the list.
+Result and notes:
+
+2. SETTINGS AND MISSING METADATA SOUND
+Open Settings, Settings, and go to Book List Reading with Ctrl+Tab.
+Choose Missing Tags Only in Missing metadata sound. Tab to Apply and press
+Space. Settings should stay open on this tab. Tab to Save to save and close.
+Arrow between a tagged book and an untagged book. Each new visit to an
+untagged book should play a short tone, including entry from another category.
+Return to Settings. Test Sound should play the same short tone.
+Choose Off and Save; navigation should now be silent. Choose another mode
+but Cancel before applying; Off should remain saved. Apply commits the
+choice, so Cancel after Apply does not undo that already-applied choice.
+The tone still depends on your computer's volume and audio output, but not
+on its Windows notification sound scheme.
+Result and notes:
+
+3. REPEATED BOOK AND CATEGORY SPEECH
+Use Ctrl+2 or Ctrl+3. Move from a populated category to an empty category,
+then to another populated category and back. Repeat in Rows layout.
+Expect one useful announcement on each move, not duplicate category names
+or an entire category of books. Find a cover, then return to the book list
+and listen for a repeated current-book title. Report remaining repetition
+with the screen reader, layout, and starting and destination categories.
+Result and notes:
+
+4. BLANK TITLE AND CANCEL BEHAVIOR
+Press F2 on a disposable book, change its author, clear its title, and Save.
+Focus should remain in Title with a short required-title message. There is
+no separate OK dialog. The author edit should still be present.
+Enter a valid title and Save. Reopen the editor and verify the values.
+Make another edit and press Escape: choose Keep Editing or Discard Changes.
+Escape itself should not save. An edit saved earlier remains saved when a
+later, unchanged editor is closed with Escape.
+Result and notes:
+
+5. SINGLE BOOK IMPORT
+Import a disposable .doc file, such as Chapter 01.doc from your example.
+The app should show progress while reading it, then an editable metadata
+dialog. Unknown source should stay blank, rather than default to Personal.
+Save. The imported book should be visible immediately without Alt+Tab,
+even if a search or filter was active before importing.
+Older .doc text extraction uses installed Microsoft Word. Record any error
+or delay, and do not overwrite the original document.
+Result and notes:
+
+6. CLEARER BACKGROUND SCAN TEST
+This replaces test 6 in the full checklist.
+a. Create an empty temporary folder in File Explorer, outside the library,
+   backups, and any existing watched folder. Call it Ebook Scan Test.
+b. In Settings, Watched Folders, add that folder. Use the status command to
+   confirm its full path and that automatic scanning is On. Close Settings.
+c. Close the manager normally. Place a COPY of one small book not already
+   in your library into Ebook Scan Test. Do not use your only original.
+d. Reopen the manager. Within the first 15 seconds, press F2 on an existing,
+   different book and focus its Notes field. Type a reversible test word.
+e. Keep the editor open for about one minute, using Tab and Shift+Tab.
+   The first automatic scan is scheduled about 15 seconds after startup.
+   If the computer or book is slow, allow longer. Later checks run about
+   every five minutes. Do not run a manual scan for this particular test.
+f. Focus should stay in the editor, without an OK popup or a scan-result
+   announcement interrupting it. Your typed word should remain in Notes.
+g. Discard the test edit. Open Help, Review Recent Messages to confirm the
+   scan finished. Find the imported book. No completion message means the
+   background-completion portion is Not tested, rather than a pass.
+h. Allow the next unchanged automatic scan. There should still be one entry
+   for the test book. Remove only Ebook Scan Test from Watched Folders when
+   done; leave your real watched folders configured.
+Result and notes:
+
+7. AUTHOR DETECTION AND METADATA WIZARD
+Use a disposable EPUB with a separate paragraph reading by Peter Vaninwagen,
+or the combined Problem of Evil example. Run Find Missing Metadata Wizard
+with Author blank on the test copy. Inspect the local results.
+The chapter file itself begins with lecture text; it does not supply an
+opening byline. The combined book has a cataloging author statement that
+the detector can now recognize. Do not expect an author to be invented
+when the source contains no identifying information.
+Open Review Metadata. The editor should open over the wizard, without
+briefly reading the book list. Cancel should return to the wizard.
+If Google Books limits requests, expect an explanatory message and continue
+with available results. The app cannot remove Google's service limit.
+Result and notes:
+
+8. SHORTER DIALOGS
+Mark two disposable books and open Bulk Edit Metadata. Tab to Apply.
+It should not read the old paragraph about blank fields at the Apply button.
+Cancel without making changes. Try folder import: folder scope and optional
+Source should be in one options dialog, with ordinary keyboard controls.
+Try removing one disposable library entry. The confirmation should identify
+the number of books and that stored files are kept, with Cancel as default.
+It should not repeat the same question several times.
+Result and notes:
+
+9. CROSS SCREEN READER CHECK
+Repeat tests 1 through 4 with JAWS, NVDA, and Narrator where available, one
+screen reader at a time. Mark unavailable readers Not tested. Automated
+tests check behavior and focus, not the precise speech you hear.
+Result and notes:

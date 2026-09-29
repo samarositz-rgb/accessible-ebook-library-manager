@@ -1,5 +1,11 @@
 __pycache__/
 build/
 dist/
+vendor/braille/
 *.spec
 .codex_git_index_*
+Application/
+Archive/
+Build/
+Source/vendor/braille/
+*.lnk
