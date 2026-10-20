@@ -121,12 +121,13 @@ def find_match(entry: dict, books: list):
 def apply_goodreads_entries(db, entries: list[dict], books: list | None = None) -> dict:
     """Update matching books. Returns counts of updated, unchanged and unmatched."""
     books = books if books is not None else db.all_books_for_duplicate_check()
-    result = {"updated": 0, "unchanged": 0, "unmatched": 0, "unmatched_titles": []}
+    result = {"updated": 0, "unchanged": 0, "unmatched": 0, "unmatched_titles": [], "unmatched_entries": []}
     for entry in entries:
         row = find_match(entry, books)
         if row is None:
             result["unmatched"] += 1
             result["unmatched_titles"].append(entry["title"])
+            result["unmatched_entries"].append(entry)
             continue
         tags = merge_tags(row[4], entry["shelves"])
         notes = merge_note(row[5], build_note(entry))
@@ -136,3 +137,55 @@ def apply_goodreads_entries(db, entries: list[dict], books: list | None = None) 
         db.update_book(row[0], row[1], row[2], row[3], tags, notes)
         result["updated"] += 1
     return result
+
+
+WISHLIST_TAG = "Wishlist"
+WISHLIST_PREFIX = "wishlist:goodreads:"
+
+
+def is_wishlist_path(stored_path) -> bool:
+    return str(stored_path or "").startswith(WISHLIST_PREFIX)
+
+
+def wishlist_key(entry: dict) -> str:
+    """A unique stand-in for the missing book file, stable across repeated imports."""
+    ident = entry["isbn"] or f"{title_key(entry['title'])}-{author_key(entry['author'])}".replace(" ", "-")
+    return WISHLIST_PREFIX + ident
+
+
+def add_wishlist_entries(db, entries: list[dict]) -> int:
+    """Add books that have no file yet, tagged Wishlist. Returns how many were added."""
+    added = 0
+    for entry in entries:
+        key = wishlist_key(entry)
+        try:
+            book_id = db.add_book(entry["title"], entry["author"], "Goodreads", "", "", "", key)
+        except Exception:
+            continue  # already present from an earlier import
+        # add_book only keeps standard category tags, so set the shelves directly.
+        tags = merge_tags("", [WISHLIST_TAG] + entry["shelves"])
+        db.update_book(book_id, entry["title"], entry["author"], "Goodreads", tags, build_note(entry))
+        if entry["isbn"]:
+            db.update_extra_fields(book_id, isbn=entry["isbn"])
+        added += 1
+    return added
+
+
+def write_unmatched_file(path, entries: list[dict]) -> None:
+    """Write a plain text list of books to look for elsewhere."""
+    lines = [f"Goodreads books not in your library: {len(entries)}", ""]
+    for entry in sorted(entries, key=lambda e: title_key(e["title"])):
+        line = f"{entry['title']} by {entry['author']}"
+        extras = []
+        if entry["isbn"]:
+            extras.append(f"ISBN {entry['isbn']}")
+        status = STATUS_LABELS.get(entry["status"], entry["status"])
+        if status:
+            extras.append(status)
+        if entry["rating"]:
+            extras.append(f"rated {entry['rating']} of 5")
+        if extras:
+            line += " (" + ", ".join(extras) + ")"
+        lines.append(line)
+    with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
+        handle.write("\n".join(lines) + "\n")

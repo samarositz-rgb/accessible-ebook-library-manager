@@ -81,5 +81,44 @@ class GoodreadsTests(unittest.TestCase):
         self.assertEqual(result["unchanged"], 1)
 
 
+class WishlistTests(unittest.TestCase):
+    def setUp(self):
+        import os
+        import shutil
+        self.tmp = tempfile.mkdtemp(prefix="gr_wishlist_")
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        old = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = self.tmp
+        self.addCleanup(lambda: os.environ.__setitem__("APPDATA", old) if old is not None else os.environ.pop("APPDATA", None))
+        from library_manager import LibraryDatabase
+        self.db = LibraryDatabase()
+        self.addCleanup(self.db.connection.close)
+        path = Path(self.tmp) / "export.csv"
+        path.write_text(CSV_TEXT, encoding="utf-8")
+        self.entries = gr.parse_goodreads_csv(path)
+
+    def test_unmatched_become_wishlist_entries_once(self):
+        first = gr.apply_goodreads_entries(self.db, self.entries)
+        self.assertEqual(first["unmatched"], 3)
+        self.assertEqual(gr.add_wishlist_entries(self.db, first["unmatched_entries"]), 3)
+        rows = self.db.all_books_for_duplicate_check()
+        self.assertEqual(len(rows), 3)
+        dune = next(r for r in rows if r[1].startswith("Dune"))
+        self.assertIn("Wishlist", dune[4])
+        self.assertIn("favorites", dune[4])
+        self.assertTrue(gr.is_wishlist_path(dune[8]))
+        self.assertEqual(dune[12], "9780441172719")
+        second = gr.apply_goodreads_entries(self.db, self.entries)
+        self.assertEqual(second["unmatched"], 0)
+        self.assertEqual(len(self.db.all_books_for_duplicate_check()), 3)
+
+    def test_unmatched_file_lists_titles(self):
+        out = Path(self.tmp) / "missing.txt"
+        gr.write_unmatched_file(out, self.entries)
+        text = out.read_text(encoding="utf-8")
+        self.assertIn("not in your library: 3", text)
+        self.assertIn("Dune (Dune, #1) by Frank Herbert (ISBN 9780441172719, read, rated 5 of 5)", text)
+
+
 if __name__ == "__main__":
     unittest.main()

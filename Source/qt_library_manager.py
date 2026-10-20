@@ -102,7 +102,7 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
-from goodreads_import import apply_goodreads_entries, parse_goodreads_csv
+from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, write_unmatched_file
 from help_file import ensure_user_help, load_help_text
 from library_utils import (
     metadata_score_from_row,
@@ -3033,6 +3033,9 @@ class QtLibraryWindow(QMainWindow):
         row = self.selected_row()
         if not row:
             return
+        if is_wishlist_path(row[8]):
+            QMessageBox.information(self, "Wishlist Entry", "This book came from Goodreads and has no book file in your library yet. Add the book file to read it.")
+            return
         path = Path(row[8])
         if not path.exists():
             QMessageBox.warning(self, "Book file missing", f"The stored book file could not be found:\n{path}")
@@ -4195,17 +4198,24 @@ class QtLibraryWindow(QMainWindow):
             QMessageBox.warning(self, "Goodreads Import", str(exc))
             return
         result = apply_goodreads_entries(self.db, entries)
+        wishlisted = add_wishlist_entries(self.db, result["unmatched_entries"])
         self.refresh_books()
         message = (
             f"Goodreads import finished. {result['updated']} updated, {result['unchanged']} already current, "
-            f"{result['unmatched']} not in your library."
+            f"{wishlisted} added to your library as Wishlist entries with no book file."
         )
-        details = message
-        if result["unmatched_titles"]:
-            shown = ", ".join(result["unmatched_titles"][:20])
-            more = len(result["unmatched_titles"]) - 20
-            details += "\n\nNot found: " + shown + (f", and {more} more." if more > 0 else ".")
-        QMessageBox.information(self, "Goodreads Import", details)
+        saved = ""
+        if result["unmatched_entries"]:
+            target, _ = QFileDialog.getSaveFileName(
+                self, "Save List of Books Not in Library", "Goodreads books not in library.txt", "Text file (*.txt)",
+            )
+            if target:
+                try:
+                    write_unmatched_file(target, result["unmatched_entries"])
+                    saved = f"\n\nThe list of those books was saved to {target}."
+                except OSError as exc:
+                    saved = f"\n\nThe list could not be saved: {exc}"
+        QMessageBox.information(self, "Goodreads Import", message + saved)
         self.routine_feedback(message)
 
     def install_file_explorer_context_menu(self):
