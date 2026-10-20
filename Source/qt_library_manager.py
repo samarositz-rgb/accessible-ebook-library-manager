@@ -102,6 +102,7 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
+from goodreads_import import apply_goodreads_entries, parse_goodreads_csv
 from help_file import ensure_user_help, load_help_text
 from library_utils import (
     metadata_score_from_row,
@@ -2206,6 +2207,7 @@ class QtLibraryWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         self.add_action(file_menu, "Add Book...", self.add_book, "Ctrl+N")
         self.add_action(file_menu, "Import Folder...", self.import_folder, "Ctrl+Shift+N")
+        self.add_action(file_menu, "Import Goodreads Export...", self.import_goodreads_export)
         self.add_action(file_menu, "Open Book", self.open_book, "Ctrl+O")
         self.add_action(file_menu, "Export Book Copy...", self.export_book, "Ctrl+E")
         self.add_action(file_menu, "Open Kindle for PC", self.open_kindle, "Ctrl+K")
@@ -4180,6 +4182,31 @@ class QtLibraryWindow(QMainWindow):
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, subkey)
         except FileNotFoundError:
             pass
+
+    def import_goodreads_export(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Goodreads Library Export", "", "Goodreads export (*.csv);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            entries = parse_goodreads_csv(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Goodreads Import", str(exc))
+            return
+        result = apply_goodreads_entries(self.db, entries)
+        self.refresh_books()
+        message = (
+            f"Goodreads import finished. {result['updated']} updated, {result['unchanged']} already current, "
+            f"{result['unmatched']} not in your library."
+        )
+        details = message
+        if result["unmatched_titles"]:
+            shown = ", ".join(result["unmatched_titles"][:20])
+            more = len(result["unmatched_titles"]) - 20
+            details += "\n\nNot found: " + shown + (f", and {more} more." if more > 0 else ".")
+        QMessageBox.information(self, "Goodreads Import", details)
+        self.routine_feedback(message)
 
     def install_file_explorer_context_menu(self):
         if not sys.platform.startswith("win") or winreg is None:

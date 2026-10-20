@@ -34,3 +34,7 @@ Settings > Settings opens categorized tabs. Ctrl+Tab and Ctrl+Shift+Tab switch c
 The Feedback tab controls optional supplementary status announcements, off by default. Help > Review Recent Messages lists the latest 10 status messages for this session, newest first. Use Up and Down Arrow to review them. Messages remain available after the status bar clears. Alt+number metadata reading remains available regardless of this setting.
 Invalid metadata stays in the editor for correction. Closing an edited metadata dialog asks before discarding changes. Cancel stops supported background jobs after the current book or step; completed work is kept. Backup, restore, and individual repair steps must finish safely. Closing during active work asks before waiting, and the interface remains responsive.
 Backups include the library database and imported book files. Watched folders are scanned for new or changed books and ignore known Voice Dream library notice files. Restore checks the backup before replacing library data.
+
+Goodreads and online lookup
+
+File > Import Goodreads Export reads the CSV file from Goodreads (My Books, Import and export, Export Library). For books already in your library it adds your shelves as tags and records your rating, reading status, date finished and review in the notes. Your own notes are kept. Nothing is sent to Goodreads. Online metadata lookup now tries Open Library, Google Books and the Open Library ISBN record, and fills blank fields from each source.

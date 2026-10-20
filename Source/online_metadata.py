@@ -89,15 +89,44 @@ def metadata_from_google_volume(volume: dict) -> dict:
     })
 
 
-def lookup_online_metadata(existing: dict, service_filter=None, cancel_check=None) -> tuple[dict, str]:
+def metadata_from_open_library_data(record: dict) -> dict:
+    """Convert an Open Library ``api/books`` data record (looked up by ISBN)."""
+    identifiers = record.get("identifiers") or {}
+    isbns = (identifiers.get("isbn_13") or []) + (identifiers.get("isbn_10") or [])
+    cover = record.get("cover") or {}
+    return normalize_online_metadata({
+        "title": record.get("title", ""),
+        "author": ", ".join(a.get("name", "") for a in record.get("authors") or []),
+        "year": record.get("publish_date", ""),
+        "isbn": isbns[0] if isbns else "",
+        "publisher": ", ".join(p.get("name", "") for p in (record.get("publishers") or [])[:1]),
+        "tags": ", ".join(s.get("name", "") for s in (record.get("subjects") or [])[:8]),
+        "cover_url": cover.get("large") or cover.get("medium") or "",
+    })
+
+
+FILL_FIELDS = ("author", "year", "isbn", "publisher", "tags", "notes", "cover_url")
+SERVICE_LABELS = {"openlibrary": "Open Library", "google": "Google Books", "openlibrary_data": "Open Library ISBN record"}
+
+
+def fill_missing_fields(primary: dict, extra: dict) -> dict:
+    """Return primary with any blank fields filled from extra."""
+    merged = dict(primary)
+    for key in FILL_FIELDS:
+        if not merged.get(key) and extra.get(key):
+            merged[key] = extra[key]
+    return merged
+
+
+def build_queries(existing: dict) -> list:
     isbn = re.sub(r"[^0-9Xx]", "", existing.get("isbn", ""))
     title = existing.get("title", "").strip()
     author = existing.get("author", "").strip()
-
     queries = []
     if isbn:
         queries.append(("openlibrary", f"https://openlibrary.org/search.json?isbn={urllib.parse.quote(isbn)}&limit=1"))
         queries.append(("google", f"https://www.googleapis.com/books/v1/volumes?q=isbn:{urllib.parse.quote(isbn)}&maxResults=1"))
+        queries.append(("openlibrary_data", f"https://openlibrary.org/api/books?bibkeys=ISBN:{urllib.parse.quote(isbn)}&jscmd=data&format=json"))
     if title:
         open_query = f"title:{title}"
         google_query = f"intitle:{title}"
@@ -106,38 +135,68 @@ def lookup_online_metadata(existing: dict, service_filter=None, cancel_check=Non
             google_query += f"+inauthor:{author}"
         queries.append(("openlibrary", "https://openlibrary.org/search.json?" + urllib.parse.urlencode({"q": open_query, "limit": "1"})))
         queries.append(("google", "https://www.googleapis.com/books/v1/volumes?" + urllib.parse.urlencode({"q": google_query, "maxResults": "1"})))
+    return queries
 
+
+def parse_service_result(service: str, data: dict) -> dict:
+    if service == "openlibrary":
+        docs = data.get("docs") or []
+        return metadata_from_open_library_doc(docs[0]) if docs else {}
+    if service == "openlibrary_data":
+        records = [value for value in data.values() if isinstance(value, dict)]
+        return metadata_from_open_library_data(records[0]) if records else {}
+    items = data.get("items") or []
+    return metadata_from_google_volume(items[0]) if items else {}
+
+
+def lookup_online_metadata(existing: dict, service_filter=None, cancel_check=None, fill_gaps=True) -> tuple[dict, str]:
+    """Look a book up online.
+
+    The first source that finds the book supplies the result. Unless a single
+    service is requested, blank fields are then filled from the other sources
+    and the returned label names every source that contributed.
+    """
     last_error = ""
     limited_services = set()
-    for service, url in queries:
+    result: dict = {}
+    contributed: list = []
+    tried_services = set()
+    for service, url in build_queries(existing):
         if cancel_check and cancel_check():
             return {}, ""
         if service_filter and service != service_filter:
             continue
-        if service in limited_services:
+        if service in limited_services or service in contributed:
             continue
+        if result and not fill_gaps:
+            break
+        if result and all(result.get(key) for key in FILL_FIELDS):
+            break
         try:
-            data = fetch_json(url)
-            if service == "openlibrary":
-                docs = data.get("docs") or []
-                if docs:
-                    return metadata_from_open_library_doc(docs[0]), "Open Library"
-            else:
-                items = data.get("items") or []
-                if items:
-                    return metadata_from_google_volume(items[0]), "Google Books"
+            found = parse_service_result(service, fetch_json(url))
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 limited_services.add(service)
-                label = "Google Books" if service == "google" else "Open Library"
+                label = SERVICE_LABELS.get(service, service)
                 last_error = f"{label} is temporarily limiting requests. Your metadata is unchanged. Continue to review the available results, or try again later."
             else:
                 last_error = str(exc)
             exc.close()
+            continue
         except Exception as exc:
             last_error = str(exc)
             continue
+        tried_services.add(service)
+        if not found:
+            continue
+        if not result:
+            result = found
+        else:
+            result = fill_missing_fields(result, found)
+        contributed.append(service)
 
+    if result:
+        return result, " and ".join(SERVICE_LABELS.get(service, service) for service in contributed)
     if last_error:
         raise RuntimeError(last_error)
     return {}, ""
