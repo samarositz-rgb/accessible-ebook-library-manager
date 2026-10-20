@@ -716,7 +716,7 @@ class LibraryDatabase:
         cursor = self.connection.execute(
             f"""
             SELECT id, title, author, source, tags, format, added_at,
-                   edition, year, isbn, publisher, series, series_number
+                   edition, year, isbn, publisher, series, series_number, stored_path
             FROM books
             {where_clause}
             ORDER BY {order_clause}

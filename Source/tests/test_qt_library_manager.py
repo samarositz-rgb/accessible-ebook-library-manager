@@ -1696,6 +1696,28 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertTrue(any(text.startswith("NLS BARD") and "copied" in text for text in seen))
         self.assertTrue(any(text.startswith("Bookshare") for text in seen))
 
+    def test_file_access_filter_separates_owned_and_wishlist_books(self):
+        real = Path(self.profile.name) / "Owned Book.txt"
+        real.write_text("text", encoding="utf-8")
+        owned = self.window.db.add_book("Owned Book", "A Author", "", "", "", str(real), str(real))
+        wish = self.window.db.add_book("Wish Book", "B Author", "", "", "", "", "wishlist:goodreads:123")
+
+        def titles():
+            return {self.window.db.get_book(i)[1] for i in self.window.single_list_ids()} if hasattr(self.window, "single_list_ids") else {
+                self.window.single_list.item(n).data(Qt.ItemDataRole.UserRole + 1) for n in range(self.window.single_list.count())}
+
+        self.window.refresh_books()
+        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
+        self.window.set_file_access_filter("have")
+        self.assertEqual(titles(), {"Owned Book"})
+        self.window.set_file_access_filter("missing")
+        self.assertEqual(titles(), {"Wish Book"})
+        self.window.set_file_access_filter("")
+        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
+        self.assertIn("Wishlist, no book file", self.window.row_text(self.window.db.search_books("Wish")[0]))
+        self.assertNotIn("Wishlist", self.window.row_text(self.window.db.search_books("Owned")[0]))
+        self.assertTrue(owned and wish)
+
     def test_find_services_choice_is_saved(self):
         from PySide6.QtWidgets import QCheckBox
         def choose(dialog):

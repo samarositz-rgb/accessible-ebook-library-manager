@@ -2188,6 +2188,7 @@ class QtLibraryWindow(QMainWindow):
         self.filter_accessibility_feature = ""
         self.filter_hide_hazard = ""
         self.filter_content_flag = ""
+        self.filter_file_access = ""
         self.active_saved_view = ""
         self.watch_scan_running = False
         self.duplicate_worker = None
@@ -2286,6 +2287,9 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(filter_menu, "By Format...", lambda: self.set_filter("format"))
         self.add_action(filter_menu, "By Accessibility Feature...", lambda: self.set_accessibility_filter("feature"))
         self.add_action(filter_menu, "Hide Books With Accessibility Hazard...", lambda: self.set_accessibility_filter("hazard"))
+        self.add_action(filter_menu, "Show Only Books I Have", lambda: self.set_file_access_filter("have"))
+        self.add_action(filter_menu, "Show Only Books I Do Not Have", lambda: self.set_file_access_filter("missing"))
+        self.add_action(filter_menu, "Show Books Whether or Not I Have Them", lambda: self.set_file_access_filter(""))
         self.add_action(filter_menu, "Clear Filters", self.clear_filters)
         saved_menu = organize_menu.addMenu("Saved Views")
         for label, view in (("Missing Metadata", "missing_metadata"), ("Recently Added", "recently_added"), ("EPUB Books", "epub"), ("Bookshare Books", "bookshare"), ("Image-Only PDFs That Need OCR", "image_only_pdf")):
@@ -2527,6 +2531,23 @@ class QtLibraryWindow(QMainWindow):
         self.filter_accessibility_feature = ""
         self.filter_hide_hazard = ""
         self.filter_content_flag = ""
+        self.filter_file_access = ""
+
+    @staticmethod
+    def row_has_book_file(row):
+        """True when the book's file is in the library. Wishlist entries never are."""
+        stored = row[13] if len(row) > 13 else ""
+        return bool(stored) and not is_wishlist_path(stored) and Path(stored).is_file()
+
+    def set_file_access_filter(self, mode):
+        self.filter_file_access = mode
+        self.active_saved_view = ""
+        self.refresh_books()
+        message = {
+            "have": "Showing only books you have.",
+            "missing": "Showing only books you do not have: wishlist entries and books whose file is missing.",
+        }.get(mode, "Showing all books, whether or not you have them.")
+        self.routine_feedback(message)
 
     def set_accessibility_filter(self, kind):
         """Ask which accessibility feature to require, or which hazard to hide."""
@@ -2578,6 +2599,8 @@ class QtLibraryWindow(QMainWindow):
             filters.append(f"Hiding books with hazard: {self.filter_hide_hazard}")
         if self.filter_content_flag:
             filters.append(f"Content note: {self.filter_content_flag.replace('_', ' ')}")
+        if self.filter_file_access:
+            filters.append("Only books I have" if self.filter_file_access == "have" else "Only books I do not have")
         if self.active_saved_view:
             filters.append(f"Saved view: {self.active_saved_view.replace('_', ' ')}")
         QMessageBox.information(
@@ -2620,6 +2643,7 @@ class QtLibraryWindow(QMainWindow):
             "format": self.filter_format, "view": self.active_saved_view,
             "accessibility_feature": self.filter_accessibility_feature,
             "hide_hazard": self.filter_hide_hazard, "content_flag": self.filter_content_flag,
+            "file_access": self.filter_file_access,
         }
         import json
         self.db.set_setting("saved_views", json.dumps(views, sort_keys=True))
@@ -2641,6 +2665,7 @@ class QtLibraryWindow(QMainWindow):
             self.filter_accessibility_feature = view.get("accessibility_feature", "")
             self.filter_hide_hazard = view.get("hide_hazard", "")
             self.filter_content_flag = view.get("content_flag", "")
+            self.filter_file_access = view.get("file_access", "")
             self.active_saved_view = view.get("view", "")
             self.refresh_books()
 
@@ -2717,7 +2742,10 @@ class QtLibraryWindow(QMainWindow):
             "format": row[5], "added_at": row[6], "edition": row[7], "year": row[8],
             "isbn": row[9], "publisher": row[10], "series": row[11], "series_number": row[12],
         }
-        return ". ".join(str(fields[key] or f"No {key.replace('_', ' ')}") for key in self.speech_fields())
+        text = ". ".join(str(fields[key] or f"No {key.replace('_', ' ')}") for key in self.speech_fields())
+        if len(row) > 13 and is_wishlist_path(row[13]):
+            text += ". Wishlist, no book file"
+        return text
 
     def refresh_books(self, selected_id=None, focus_books=True):
         modal = QApplication.activeModalWidget()
@@ -2732,6 +2760,9 @@ class QtLibraryWindow(QMainWindow):
             content_flag_filter=self.filter_content_flag,
             extra_ids=content_ids,
         )
+        if self.filter_file_access:
+            wanted = self.filter_file_access == "have"
+            rows = [row for row in rows if self.row_has_book_file(row) == wanted]
         if self.active_saved_view == "missing_metadata":
             rows = [row for row in rows if any(not str(row[index] or "").strip() for index in (2, 7, 8, 9, 10))]
         if self.sort_by in {"title", "title_desc"}:
