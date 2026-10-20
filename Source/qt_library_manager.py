@@ -103,6 +103,8 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
+from audiobook_scan import import_audiobooks, scan_audiobook_folder
+from goodreads_export import export_goodreads_csv
 from find_elsewhere import SERVICES as FIND_SERVICES, SETTING_KEY as FIND_SERVICES_SETTING, enabled_services, search_gutenberg, search_words, service_target
 from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, write_unmatched_file
 from help_file import ensure_user_help, load_help_text
@@ -2211,6 +2213,8 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(file_menu, "Add Book...", self.add_book, "Ctrl+N")
         self.add_action(file_menu, "Import Folder...", self.import_folder, "Ctrl+Shift+N")
         self.add_action(file_menu, "Import Goodreads Export...", self.import_goodreads_export)
+        self.add_action(file_menu, "Export Library for Goodreads...", self.export_library_for_goodreads)
+        self.add_action(file_menu, "Import Audiobook Folder (M4B, Libation)...", self.import_audiobook_folder)
         self.add_action(file_menu, "Open Book", self.open_book, "Ctrl+O")
         self.add_action(file_menu, "Export Book Copy...", self.export_book, "Ctrl+E")
         self.add_action(file_menu, "Open Kindle for PC", self.open_kindle, "Ctrl+K")
@@ -4301,6 +4305,52 @@ class QtLibraryWindow(QMainWindow):
         layout.addWidget(buttons)
         results.setFocus(Qt.FocusReason.OtherFocusReason)
         dialog.exec()
+
+    def export_library_for_goodreads(self):
+        include_all = QMessageBox.question(
+            self, "Export for Goodreads",
+            "Include books that have no reading status yet? Goodreads will place them on its To Read shelf. "
+            "Choose No to export only wishlist books and books with a status from an earlier Goodreads import.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Save Goodreads Import File", "library for goodreads.csv", "CSV file (*.csv)",
+        )
+        if not target:
+            return
+        try:
+            count = export_goodreads_csv(target, self.db.all_books_for_duplicate_check(), include_all)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export for Goodreads", f"The file could not be saved: {exc}")
+            return
+        message = f"Saved {count} books to {target}."
+        QMessageBox.information(
+            self, "Export for Goodreads",
+            message + "\n\nOn Goodreads, choose My Books, then Import and export, then Import, and select this file.",
+        )
+        self.routine_feedback(message)
+
+    def import_audiobook_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose Audiobook Folder, such as your Libation library")
+        if not folder:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            items = scan_audiobook_folder(folder)
+            result = import_audiobooks(self.db, items)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.refresh_books()
+        message = (
+            f"Found {len(items)} audiobooks. {result['added']} added, {result['linked']} matched to wishlist books, "
+            f"{result['already_linked']} already in the library, {result['already_have']} skipped because you already have that book."
+        )
+        QMessageBox.information(
+            self, "Audiobook Import",
+            message + "\n\nAudiobook files stay where they are. Removing a book from the library never deletes them.",
+        )
+        self.routine_feedback(message)
 
     def import_goodreads_export(self):
         path, _ = QFileDialog.getOpenFileName(

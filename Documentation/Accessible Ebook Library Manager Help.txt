@@ -39,6 +39,12 @@ Goodreads and online lookup
 
 File > Import Goodreads Export reads the CSV file from Goodreads (My Books, Import and export, Export Library). For books already in your library it adds your shelves as tags and records your rating, reading status, date finished and review in the notes. Your own notes are kept. Goodreads books that are not in your library are added as entries tagged Wishlist, with no book file, and you are offered a text file listing them so you can look for them elsewhere. Run the import again after adding files and the entries are matched and updated rather than duplicated. Goodreads books that are not in your library are added as entries tagged Wishlist, with no book file, and you are offered a text file listing them so you can look for them elsewhere. Run the import again after adding files and the entries are matched and updated rather than duplicated. Nothing is sent to Goodreads.
 
+Audiobooks and exporting to Goodreads
+
+File > Import Audiobook Folder reads a folder of M4B files, such as your Libation library, including its subfolders. Titles, authors, narrators and years come from the tags inside each file, or from the Libation folder and file names. A wishlist book with the same title and author is linked to its audiobook instead of being duplicated. Anything else is added with the tag Audiobook. The files are never copied or changed, and removing a book from the library never deletes them. Run it again after Libation downloads more books.
+
+File > Export Library for Goodreads saves a CSV file with titles, authors, ISBNs, shelves, ratings, reading status, dates and reviews. Goodreads does not let other programs add books directly, so on Goodreads choose My Books, Import and export, Import, and select the file. You are asked whether to include books that have no reading status; Goodreads puts those on To Read.
+
 Books you have and books you do not
 
 A book with no file in your library, such as a Goodreads wishlist entry, is read out with the words Wishlist, no book file at the end. Organize > Filter has three choices: Show Only Books I Have, Show Only Books I Do Not Have (wishlist entries and books whose file has gone missing), and Show Books Whether or Not I Have Them. The filter is also stored in saved views, and Clear Filters resets it.
