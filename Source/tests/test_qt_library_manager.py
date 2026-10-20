@@ -1678,6 +1678,35 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(self.window.search.selectedText(), "Target")
         self.assertEqual(self.window.marked_ids, {first, second})
 
+    def test_find_book_elsewhere_lists_gutenberg_and_login_services(self):
+        from PySide6.QtWidgets import QListWidget
+        book_id = self.add_book("Pride and Prejudice", "Jane Austen")
+        seen = []
+
+        def capture(dialog):
+            seen.extend(dialog.findChild(QListWidget).item(i).text() for i in range(dialog.findChild(QListWidget).count()))
+            return 0
+
+        hit = [{"title": "Pride and Prejudice", "author": "Jane Austen", "url": "https://www.gutenberg.org/ebooks/1342"}]
+        with patch.object(self.window, "selected_row", return_value=self.window.db.get_book(book_id)), \
+                patch("qt_library_manager.search_gutenberg", return_value=hit), \
+                patch.object(QDialog, "exec", new=capture):
+            self.window.find_book_elsewhere()
+        self.assertTrue(any(text.startswith("Project Gutenberg, free download") for text in seen))
+        self.assertTrue(any(text.startswith("NLS BARD") and "copied" in text for text in seen))
+        self.assertTrue(any(text.startswith("Bookshare") for text in seen))
+
+    def test_find_services_choice_is_saved(self):
+        from PySide6.QtWidgets import QCheckBox
+        def choose(dialog):
+            for box in dialog.findChildren(QCheckBox):
+                box.setChecked(box.text().startswith(("Bookshare", "Project Gutenberg")))
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(QDialog, "exec", new=choose):
+            self.window.choose_find_services()
+        self.assertEqual(self.window.db.get_setting("find_elsewhere_services", ""), "gutenberg,bookshare")
+
 
 if __name__ == "__main__":
     unittest.main()
