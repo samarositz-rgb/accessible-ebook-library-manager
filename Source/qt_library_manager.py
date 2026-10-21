@@ -105,7 +105,7 @@ from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
 from audiobook_scan import import_audiobooks, scan_audiobook_folder
 from goodreads_export import export_goodreads_csv
-from find_elsewhere import GROUP_SETTINGS as FIND_GROUP_SETTINGS, GROUP_TITLES as FIND_GROUP_TITLES, LIBRARY_KEY_SETTING as FIND_LIBRARY_SETTING, SERVICES as FIND_SERVICES, enabled_services, search_gutenberg, search_words, service_target, services_in_group
+from find_elsewhere import GROUP_TITLES as FIND_GROUP_TITLES, LIBRARY_KEY_SETTING as FIND_LIBRARY_SETTING, SERVICES as FIND_SERVICES, search_gutenberg, search_words, service_target, services_in_group
 from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, rename_legacy_wishlist_tags, write_unmatched_file
 from help_file import ensure_user_help, load_help_text
 from library_utils import (
@@ -2235,10 +2235,7 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(book_menu, "Bulk Edit Selected Metadata...", self.bulk_edit_metadata)
         self.add_action(book_menu, "Find Missing Metadata Wizard...", self.auto_detect_metadata, "Ctrl+D")
         self.add_action(book_menu, "Look Up Metadata Online...", self.lookup_metadata_online)
-        self.add_action(book_menu, "Find Book on Free and Accessible Services...", lambda: self.find_book_elsewhere("free"))
-        self.add_action(book_menu, "Find Book on Commercial Services...", lambda: self.find_book_elsewhere("commercial"))
-        self.add_action(book_menu, "Find Book at My Library (Libby, Hoopla)...", lambda: self.find_book_elsewhere("library"))
-        self.add_action(book_menu, "Choose Services for Finding Books...", self.choose_find_services)
+        self.add_action(book_menu, "Find Book on Other Services...", self.find_book_elsewhere)
         repair_menu = book_menu.addMenu("Repair")
         self.add_action(repair_menu, "Cleanup and Repair Wizard...", self.cleanup_repair_wizard)
         self.add_action(repair_menu, "Check EPUB Accessibility Metadata", self.check_epub_accessibility)
@@ -4231,73 +4228,33 @@ class QtLibraryWindow(QMainWindow):
         except FileNotFoundError:
             pass
 
-    def choose_find_services(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Services for Finding Books")
-        layout = QVBoxLayout(dialog)
-        boxes = {}
-        for group, title in FIND_GROUP_TITLES.items():
-            layout.addWidget(QLabel(title, dialog))
-            current = enabled_services(self.db.get_setting(FIND_GROUP_SETTINGS[group], ""), group)
-            for key in services_in_group(group):
-                label, _template, _site, account, _group = FIND_SERVICES[key]
-                box = QCheckBox(label + (" (needs your member login)" if account else ""), dialog)
-                box.setChecked(key in current)
-                layout.addWidget(box)
-                boxes[key] = box
-        layout.addWidget(QLabel("Your library's Libby or OverDrive name, such as nypl for nypl.overdrive.com. Leave blank to open the Libby site instead.", dialog))
-        library_name = QLineEdit(self.db.get_setting(FIND_LIBRARY_SETTING, ""), dialog)
-        library_name.setAccessibleName("Library Libby or OverDrive name")
-        layout.addWidget(library_name)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            for group in FIND_GROUP_TITLES:
-                chosen = [key for key in services_in_group(group) if boxes[key].isChecked()]
-                self.db.set_setting(FIND_GROUP_SETTINGS[group], ",".join(chosen) if chosen else "none")
-            self.db.set_setting(FIND_LIBRARY_SETTING, library_name.text().strip())
-            self.routine_feedback("Services for finding books saved.")
-
-    def find_book_elsewhere(self, group="free"):
+    def find_book_elsewhere(self):
         row = self.selected_row()
         if not row:
             return
         words = search_words(row[1], row[2])
-        services = enabled_services(self.db.get_setting(FIND_GROUP_SETTINGS[group], ""), group)
-        library_key = self.db.get_setting(FIND_LIBRARY_SETTING, "")
         entries = []
         problem = ""
-        if "gutenberg" in services:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                for hit in search_gutenberg(row[1], row[2]):
-                    entries.append((f"Project Gutenberg, free download: {hit['title']} by {hit['author']}", hit["url"], ""))
-            except Exception as exc:
-                problem = f"Project Gutenberg could not be searched: {exc}"
-            finally:
-                QApplication.restoreOverrideCursor()
-        pages = []
-        for key in services:
-            url, label, paste = service_target(key, words, library_key)
-            pages.append((url, words if paste else ""))
-            if paste:
-                entries.append((f"{label}: open the site and search for {words}. The search words are copied for you to paste.", url, words))
-            else:
-                entries.append((f"{label}: search for {words}", url, ""))
-        if not services:
-            QMessageBox.information(self, "Find Book", "No services are chosen in this group. Use Book, Choose Services for Finding Books.")
-            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for hit in search_gutenberg(row[1], row[2]):
+                entries.append((f"Project Gutenberg, free download: {hit['title']} by {hit['author']}", hit["url"], ""))
+        except Exception as exc:
+            problem = f"Project Gutenberg could not be searched: {exc}"
+        finally:
+            QApplication.restoreOverrideCursor()
+        for group, group_title in FIND_GROUP_TITLES.items():
+            for key in services_in_group(group):
+                entries.append((f"{group_title}, {FIND_SERVICES[key][0]}", key, words))
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Find {row[1]}: {FIND_GROUP_TITLES[group]}")
-        dialog.resize(700, 420)
+        dialog.setWindowTitle(f"Find {row[1]} Elsewhere")
+        dialog.resize(700, 460)
         layout = QVBoxLayout(dialog)
         results = QListWidget(dialog)
-        results.setAccessibleName("Places to find this book. Press Enter to open one.")
-        for text, url, paste in entries:
+        results.setAccessibleName("Places to find this book. Press Enter to open only the one you are on.")
+        for text, target, paste in entries:
             item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, (url, paste))
+            item.setData(Qt.ItemDataRole.UserRole, (target, paste))
             results.addItem(item)
         results.setCurrentRow(0)
         layout.addWidget(results)
@@ -4310,23 +4267,27 @@ class QtLibraryWindow(QMainWindow):
             item = results.currentItem()
             if item is None:
                 return
-            url, paste = item.data(Qt.ItemDataRole.UserRole)
-            if paste:
-                QApplication.clipboard().setText(paste)
-            QDesktopServices.openUrl(QUrl(url))
-
-        def open_all():
-            for url, paste in pages:
-                if paste:
+            target, paste = item.data(Qt.ItemDataRole.UserRole)
+            if target in FIND_SERVICES:
+                library_key = self.db.get_setting(FIND_LIBRARY_SETTING, "")
+                if target == "libby" and not library_key:
+                    name, accepted = QInputDialog.getText(
+                        dialog, "Your Library",
+                        "Your library's Libby or OverDrive name, such as nypl for nypl.overdrive.com. Leave blank to open the Libby site instead:",
+                    )
+                    if accepted and name.strip():
+                        library_key = name.strip()
+                        self.db.set_setting(FIND_LIBRARY_SETTING, library_key)
+                url, _label, needs_paste = service_target(target, paste, library_key)
+                if needs_paste:
                     QApplication.clipboard().setText(paste)
                 QDesktopServices.openUrl(QUrl(url))
-            self.routine_feedback(f"Opened {len(pages)} searches in your browser.")
+            else:
+                QDesktopServices.openUrl(QUrl(target))
 
         results.itemActivated.connect(lambda _item: open_current())
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        open_all_button = buttons.addButton("Open All Searches", QDialogButtonBox.ButtonRole.ActionRole)
-        open_all_button.clicked.connect(open_all)
-        open_button = buttons.addButton("Open Selected", QDialogButtonBox.ButtonRole.ActionRole)
+        open_button = buttons.addButton("Open", QDialogButtonBox.ButtonRole.ActionRole)
         open_button.clicked.connect(open_current)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)

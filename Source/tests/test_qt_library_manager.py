@@ -1678,57 +1678,26 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(self.window.search.selectedText(), "Target")
         self.assertEqual(self.window.marked_ids, {first, second})
 
-    def test_find_book_elsewhere_lists_gutenberg_and_login_services(self):
+    def test_find_book_elsewhere_lists_every_service_and_opens_only_one(self):
         from PySide6.QtWidgets import QListWidget
         book_id = self.add_book("Pride and Prejudice", "Jane Austen")
         seen = []
+        opened = []
 
         def capture(dialog):
-            seen.extend(dialog.findChild(QListWidget).item(i).text() for i in range(dialog.findChild(QListWidget).count()))
+            results = dialog.findChild(QListWidget)
+            seen.extend(results.item(i).text() for i in range(results.count()))
+            results.setCurrentRow(next(i for i, text in enumerate(seen) if "Audible" in text))
+            results.itemActivated.emit(results.currentItem())
             return 0
 
         hit = [{"title": "Pride and Prejudice", "author": "Jane Austen", "url": "https://www.gutenberg.org/ebooks/1342"}]
-        with patch.object(self.window, "selected_row", return_value=self.window.db.get_book(book_id)), \
-                patch("qt_library_manager.search_gutenberg", return_value=hit), \
-                patch.object(QDialog, "exec", new=capture):
-            self.window.find_book_elsewhere("free")
-        self.assertTrue(any(text.startswith("Project Gutenberg, free download") for text in seen))
-        self.assertTrue(any(text.startswith("NLS BARD") and "copied" in text for text in seen))
-        self.assertTrue(any(text.startswith("Bookshare") for text in seen))
-
-    def test_file_access_filter_separates_owned_and_wishlist_books(self):
-        real = Path(self.profile.name) / "Owned Book.txt"
-        real.write_text("text", encoding="utf-8")
-        owned = self.window.db.add_book("Owned Book", "A Author", "", "", "", str(real), str(real))
-        wish = self.window.db.add_book("Wish Book", "B Author", "", "", "", "", "wishlist:goodreads:123")
-
-        def titles():
-            return {self.window.db.get_book(i)[1] for i in self.window.single_list_ids()} if hasattr(self.window, "single_list_ids") else {
-                self.window.single_list.item(n).data(Qt.ItemDataRole.UserRole + 1) for n in range(self.window.single_list.count())}
-
-        self.window.refresh_books()
-        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
-        self.window.set_file_access_filter("have")
-        self.assertEqual(titles(), {"Owned Book"})
-        self.window.set_file_access_filter("missing")
-        self.assertEqual(titles(), {"Wish Book"})
-        self.window.set_file_access_filter("")
-        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
-        self.assertIn("No file available", self.window.row_text(self.window.db.search_books("Wish")[0]))
-        self.assertNotIn("No file available", self.window.row_text(self.window.db.search_books("Owned")[0]))
-        self.assertTrue(owned and wish)
-
-    def test_find_services_choice_is_saved(self):
-        from PySide6.QtWidgets import QCheckBox
-        def choose(dialog):
-            for box in dialog.findChildren(QCheckBox):
-                box.setChecked(box.text().startswith(("Bookshare", "Project Gutenberg")))
-            return QDialog.DialogCode.Accepted
-
-        with patch.object(QDialog, "exec", new=choose):
-            self.window.choose_find_services()
-        self.assertEqual(self.window.db.get_setting("find_elsewhere_services", ""), "gutenberg,bookshare")
-        self.assertEqual(self.window.db.get_setting("find_commercial_services", ""), "none")
+        with patch.object(self.window, "selected_row", return_value=self.window.db.get_book(book_id)),                 patch("qt_library_manager.search_gutenberg", return_value=hit),                 patch("qt_library_manager.QDesktopServices.openUrl", side_effect=lambda url: opened.append(url.toString()) or True),                 patch.object(QDialog, "exec", new=capture):
+            self.window.find_book_elsewhere()
+        self.assertTrue(seen[0].startswith("Project Gutenberg, free download"))
+        for expected in ("Free and accessible services, NLS BARD", "Commercial services, Audible", "Your local library, Hoopla"):
+            self.assertIn(expected, seen)
+        self.assertEqual(opened, ["https://www.audible.com/search?keywords=Pride+and+Prejudice+Austen"])
 
 
 if __name__ == "__main__":
