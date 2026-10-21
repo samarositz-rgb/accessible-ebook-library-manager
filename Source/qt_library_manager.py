@@ -103,7 +103,7 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
-from audiobook_scan import import_audiobooks, scan_audiobook_folder
+from audiobook_scan import first_audio_file, import_audiobooks, scan_audiobook_folder
 from goodreads_export import export_goodreads_csv
 from find_elsewhere import GROUP_TITLES as FIND_GROUP_TITLES, LIBRARY_KEY_SETTING as FIND_LIBRARY_SETTING, SERVICES as FIND_SERVICES, search_gutenberg, search_words, service_target, services_in_group
 from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, rename_legacy_wishlist_tags, write_unmatched_file
@@ -2218,7 +2218,7 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(file_menu, "Import Folder...", self.import_folder, "Ctrl+Shift+N")
         self.add_action(file_menu, "Import Goodreads Export...", self.import_goodreads_export)
         self.add_action(file_menu, "Export Library for Goodreads...", self.export_library_for_goodreads)
-        self.add_action(file_menu, "Import Audiobook Folder (M4B, Libation)...", self.import_audiobook_folder)
+        self.add_action(file_menu, "Import Audiobook Folder or Drive...", self.import_audiobook_folder)
         self.add_action(file_menu, "Open Book", self.open_book, "Ctrl+O")
         self.add_action(file_menu, "Export Book Copy...", self.export_book, "Ctrl+E")
         self.add_action(file_menu, "Open Kindle for PC", self.open_kindle, "Ctrl+K")
@@ -2544,7 +2544,7 @@ class QtLibraryWindow(QMainWindow):
     def row_has_book_file(row):
         """True when the book's file is in the library. No File Available entries never are."""
         stored = row[13] if len(row) > 13 else ""
-        return bool(stored) and not is_wishlist_path(stored) and Path(stored).is_file()
+        return bool(stored) and not is_wishlist_path(stored) and Path(stored).exists()
 
     def set_file_access_filter(self, mode):
         self.filter_file_access = mode
@@ -3080,8 +3080,14 @@ class QtLibraryWindow(QMainWindow):
             return
         path = Path(row[8])
         if not path.exists():
-            QMessageBox.warning(self, "Book file missing", f"The stored book file could not be found:\n{path}")
+            QMessageBox.warning(self, "Book file missing", f"The stored book file could not be found:\n{path}\n\nIf it is on a drive or network location, check that it is connected.")
             return
+        if path.is_dir():
+            first = first_audio_file(path)
+            if first is None:
+                QMessageBox.warning(self, "Audiobook folder empty", f"No audio files were found in:\n{path}")
+                return
+            path = first
         notes = describe_flags(self.db.get_content_flags(row[0]))
         if notes:
             # Say it before the reader takes focus, so a silent scanned PDF is no surprise.
@@ -4320,7 +4326,7 @@ class QtLibraryWindow(QMainWindow):
         self.routine_feedback(message)
 
     def import_audiobook_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Choose Audiobook Folder, such as your Libation library")
+        folder = QFileDialog.getExistingDirectory(self, "Choose Audiobook Folder or Drive, such as your Libation library")
         if not folder:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)

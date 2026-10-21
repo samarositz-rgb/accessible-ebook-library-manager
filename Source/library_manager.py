@@ -449,12 +449,14 @@ class LibraryDatabase:
         self.connection.commit()
         return cursor.lastrowid
 
-    def link_book_file(self, book_id, path):
-        """Point an existing entry at a file that stays where it is (not copied)."""
+    def link_book_file(self, book_id, path, file_format=None):
+        """Point an existing entry at a file or folder that stays where it is (not copied)."""
         path = str(path)
+        if file_format is None:
+            file_format = Path(path).suffix.lower().lstrip(".")
         self.connection.execute(
             "UPDATE books SET stored_path = ?, original_path = ?, format = ? WHERE id = ?",
-            (path, path, Path(path).suffix.lower().lstrip("."), book_id),
+            (path, path, file_format, book_id),
         )
         self.connection.commit()
 
