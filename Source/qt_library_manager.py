@@ -103,6 +103,7 @@ from library_manager import (
 )
 from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
+from audiobook_convert import FFMPEG_SETTING, INSTALL_HELP, OUTPUT_FOLDER_SETTING, can_convert, convert_to_m4b, find_ffmpeg
 from audiobook_scan import first_audio_file, import_audiobooks, scan_audiobook_folder
 from goodreads_export import export_goodreads_csv
 from find_elsewhere import GROUP_TITLES as FIND_GROUP_TITLES, LIBRARY_KEY_SETTING as FIND_LIBRARY_SETTING, SERVICES as FIND_SERVICES, search_gutenberg, search_words, service_target, services_in_group
@@ -1625,6 +1626,55 @@ class ConvertBooksWorker(QThread):
         self.completed.emit(converted, issues)
 
 
+class AudiobookConvertWorker(QThread):
+    progress = Signal(str)
+    completed = Signal(int, list)
+
+    def __init__(self, books, ffmpeg, output_folder, parent=None):
+        super().__init__(parent)
+        self.books = list(books)
+        self.ffmpeg = ffmpeg
+        self.output_folder = Path(output_folder)
+
+    def run(self):
+        database = None
+        converted = 0
+        issues = []
+        try:
+            database = LibraryDatabase()
+            for index, row in enumerate(self.books, start=1):
+                if self.isInterruptionRequested():
+                    break
+                title = row[1]
+                self.progress.emit(f"Converting {index} of {len(self.books)} to M4B: {title}")
+                try:
+                    narrator = ""
+                    for line in str(row[5] or "").splitlines():
+                        match = re.match(r"Narrated by (.+?)\.?$", line.strip())
+                        if match:
+                            narrator = match.group(1)
+                    output = convert_to_m4b(
+                        self.ffmpeg, row[8], self.output_folder, title, row[2] or "", narrator, str(row[11] or ""),
+                        cancel_check=self.isInterruptionRequested,
+                        progress=lambda text, n=index, t=title: self.progress.emit(f"Converting {n} of {len(self.books)} to M4B: {t}. {text}."),
+                    )
+                    note = f"Converted to M4B from {row[8]}. The original files were kept."
+                    notes = (str(row[5]) + "\n" if row[5] else "") + note
+                    database.link_book_file(row[0], output, "m4b")
+                    database.update_book(row[0], row[1], row[2], row[3], row[4], notes)
+                    converted += 1
+                except Exception as exc:
+                    if str(exc) == "Cancelled":
+                        break
+                    issues.append(f"{title}: {exc}")
+        except Exception as exc:
+            issues.append(str(exc))
+        finally:
+            if database:
+                database.close()
+        self.completed.emit(converted, issues)
+
+
 class LibraryOperations:
     """Adapt existing non-UI import and watch-folder routines for Qt workers."""
 
@@ -2250,6 +2300,7 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(book_menu, "View Cover Image...", self.view_cover_image)
         self.add_action(book_menu, "Find Cover Image Online...", self.find_cover_image)
         self.add_action(book_menu, "Convert Selected Books to EPUB...", self.convert_selected_to_epub, "Ctrl+R")
+        self.add_action(book_menu, "Convert Selected Audiobooks to M4B...", self.convert_audiobooks_to_m4b)
         self.add_action(book_menu, "Select All Books (Ctrl+A)", self.select_all)
         self.add_action(book_menu, "Deselect All Books (Ctrl+Shift+A)", self.deselect_all)
         self.add_action(book_menu, "Delete from Library...", self.delete_books, "Delete")
@@ -4161,6 +4212,64 @@ class QtLibraryWindow(QMainWindow):
         self.connect_worker_result(worker, self.conversion_finished)
         worker.start()
 
+    def convert_audiobooks_to_m4b(self):
+        ffmpeg = find_ffmpeg(self.db.get_setting(FFMPEG_SETTING, ""))
+        if not ffmpeg:
+            choose = QMessageBox.question(
+                self, "FFmpeg Not Found", INSTALL_HELP + "\n\nDo you want to choose ffmpeg.exe now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if choose != QMessageBox.StandardButton.Yes:
+                return
+            path, _ = QFileDialog.getOpenFileName(self, "Choose ffmpeg.exe", "", "ffmpeg (ffmpeg.exe);;All files (*.*)")
+            if not path:
+                return
+            self.db.set_setting(FFMPEG_SETTING, path)
+            ffmpeg = path
+        books = []
+        for book_id in self.current_ids():
+            row = self.db.get_book(book_id)
+            if row and can_convert(row[8]):
+                books.append(row)
+        if not books:
+            self.routine_feedback("No audiobooks to convert. Select books that are folders of MP3 or M4A parts, MP3 or M4A files, or audio ZIP files.")
+            return
+        default = self.db.get_setting(OUTPUT_FOLDER_SETTING, "") or str(Path.home() / "Documents" / "Audiobooks M4B")
+        folder = QFileDialog.getExistingDirectory(self, "Choose Folder for the New M4B Files", default)
+        if not folder:
+            return
+        self.db.set_setting(OUTPUT_FOLDER_SETTING, folder)
+        answer = QMessageBox.question(
+            self, "Convert to M4B",
+            f"Convert {len(books)} audiobook(s) to M4B in {folder}? Your original files are kept, and each book will then open the new M4B. Long books can take several minutes.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.progress_dialog = QProgressDialog("Converting audiobooks to M4B...", "", 0, 0, self)
+        self.progress_dialog.setWindowTitle("Convert to M4B")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setCancelButton(None)
+        self.progress_dialog.show()
+        worker = AudiobookConvertWorker(books, ffmpeg, folder, self)
+        self.active_worker = worker
+        worker.progress.connect(self.progress_dialog.setLabelText)
+        self.connect_worker_result(worker, self.m4b_conversion_finished)
+        worker.start()
+
+    def m4b_conversion_finished(self, converted, issues):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        self.refresh_books()
+        self.setFocusToCurrentBook()
+        text = f"Converted {converted} audiobook(s) to M4B. Your original files were kept."
+        if issues:
+            text += "\n\nNot converted:\n" + "\n".join(issues[:20])
+            QMessageBox.warning(self, "M4B Conversion Results", text)
+        else:
+            self.routine_feedback(f"Converted {converted} audiobooks to M4B.", text)
+
     def conversion_finished(self, converted, issues):
         if self.progress_dialog:
             self.progress_dialog.close()
@@ -5079,7 +5188,7 @@ class QtLibraryWindow(QMainWindow):
         if dialog:
             dialog.operation_worker = worker
             cancellable = isinstance(worker, (ReindexWorker, FolderScanWorker, FolderImportWorker,
-                CombinedPartsWorker, CopyBooksWorker, ExportEpubWorker, ConvertBooksWorker,
+                CombinedPartsWorker, CopyBooksWorker, ExportEpubWorker, ConvertBooksWorker, AudiobookConvertWorker,
                 OnlineMetadataWorker, WatchedFolderWorker))
             if cancellable:
                 dialog.setAutoClose(False)
@@ -5139,7 +5248,7 @@ class QtLibraryWindow(QMainWindow):
         if isinstance(worker, WatchedFolderWorker):
             self.watch_scan_running = False
             message += f" Updated items: {args[1] if len(args) > 1 else 0}."
-        if isinstance(worker, (FolderImportWorker, ConvertBooksWorker, WatchedFolderWorker)):
+        if isinstance(worker, (FolderImportWorker, ConvertBooksWorker, AudiobookConvertWorker, WatchedFolderWorker)):
             row = self.selected_row()
             self.refresh_books(row[0] if row else None)
         if isinstance(worker, OnlineMetadataWorker):

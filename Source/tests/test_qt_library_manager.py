@@ -1678,6 +1678,51 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(self.window.search.selectedText(), "Target")
         self.assertEqual(self.window.marked_ids, {first, second})
 
+    def test_m4b_conversion_worker_links_new_file_and_keeps_originals(self):
+        import subprocess
+        from audiobook_convert import find_ffmpeg
+        from qt_library_manager import AudiobookConvertWorker
+        ffmpeg = find_ffmpeg(os.environ.get("FFMPEG_TEST_PATH", ""))
+        if not ffmpeg:
+            self.skipTest("FFmpeg is not installed")
+        folder = Path(self.profile.name) / "Parts"
+        folder.mkdir()
+        for number in (1, 2):
+            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", str(folder / f"{number}.mp3")], check=True)
+        book_id = self.window.db.add_book("Parts Book", "An Author", "", "", "Narrated by A Voice.", str(folder), str(folder))
+        row = self.window.db.get_book(book_id)
+        out = Path(self.profile.name) / "out"
+        worker = AudiobookConvertWorker([row], ffmpeg, out)
+        results = []
+        worker.completed.connect(lambda converted, issues: results.append((converted, issues)))
+        worker.run()
+        self.assertEqual(results, [(1, [])])
+        updated = self.window.db.get_book(book_id)
+        self.assertTrue(updated[8].endswith(".m4b") and Path(updated[8]).is_file())
+        self.assertEqual(updated[6], "m4b")
+        self.assertIn("The original files were kept", updated[5])
+        self.assertTrue((folder / "1.mp3").exists())
+
+    def test_file_access_filter_separates_owned_and_no_file_books(self):
+        real = Path(self.profile.name) / "Owned Book.txt"
+        real.write_text("text", encoding="utf-8")
+        self.window.db.add_book("Owned Book", "A Author", "", "", "", str(real), str(real))
+        self.window.db.add_book("Wish Book", "B Author", "", "", "", "", "wishlist:goodreads:123")
+
+        def titles():
+            return {self.window.single_list.item(n).data(Qt.ItemDataRole.UserRole + 1) for n in range(self.window.single_list.count())}
+
+        self.window.refresh_books()
+        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
+        self.window.set_file_access_filter("have")
+        self.assertEqual(titles(), {"Owned Book"})
+        self.window.set_file_access_filter("missing")
+        self.assertEqual(titles(), {"Wish Book"})
+        self.window.set_file_access_filter("")
+        self.assertEqual(titles(), {"Owned Book", "Wish Book"})
+        self.assertIn("No file available", self.window.row_text(self.window.db.search_books("Wish")[0]))
+        self.assertNotIn("No file available", self.window.row_text(self.window.db.search_books("Owned")[0]))
+
     def test_find_book_elsewhere_lists_every_service_and_opens_only_one(self):
         from PySide6.QtWidgets import QListWidget
         book_id = self.add_book("Pride and Prejudice", "Jane Austen")
