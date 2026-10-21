@@ -18,7 +18,7 @@ COLUMNS = [
     "Date Read", "Bookshelves", "Exclusive Shelf", "My Review", "Private Notes",
 ]
 STATUS_BY_LABEL = {label: key for key, label in STATUS_LABELS.items()}
-SKIP_SHELVES = {WISHLIST_TAG.casefold(), "audiobook"}
+SKIP_SHELVES = set()  # filled below, once shelf_name exists
 
 
 def parse_goodreads_note(notes: str) -> dict:
@@ -49,6 +49,9 @@ def parse_goodreads_note(notes: str) -> dict:
 
 def shelf_name(tag: str) -> str:
     return re.sub(r"[^a-z0-9\-]+", "-", tag.strip().casefold()).strip("-")
+
+
+SKIP_SHELVES.update({shelf_name(WISHLIST_TAG), "wishlist", "audiobook"})
 
 
 def export_row(row, include_without_status: bool = True) -> dict | None:

@@ -18,28 +18,54 @@ try:
 except ImportError:  # defusedxml is optional
     _safe_fromstring = ET.fromstring
 
-SETTING_KEY = "find_elsewhere_services"
+SETTING_KEY = "find_elsewhere_services"  # free and accessible services (kept for older libraries)
+LIBRARY_KEY_SETTING = "libby_library_key"
+GROUP_SETTINGS = {
+    "free": SETTING_KEY,
+    "commercial": "find_commercial_services",
+    "library": "find_library_services",
+}
+GROUP_TITLES = {
+    "free": "Free and accessible services",
+    "commercial": "Commercial services",
+    "library": "Your local library",
+}
 
 # key: (label, search address with {q} for the encoded search words, or "" when the
-# site has no public search address, site address, needs a member account)
+# site has no public search address, site address, needs a member account, group)
 SERVICES = {
-    "gutenberg": ("Project Gutenberg", "https://www.gutenberg.org/ebooks/search/?query={q}", "https://www.gutenberg.org", False),
-    "bookshare": ("Bookshare", "https://www.bookshare.org/search?keyword={q}", "https://www.bookshare.org", True),
-    "bard": ("NLS BARD", "", "https://nlsbard.loc.gov", True),
-    "learningally": ("Learning Ally", "", "https://learningally.org", True),
-    "archive": ("Internet Archive", "https://archive.org/search?query={q}", "https://archive.org", False),
-    "standardebooks": ("Standard Ebooks", "https://standardebooks.org/ebooks?query={q}", "https://standardebooks.org", False),
-    "openlibrary": ("Open Library", "https://openlibrary.org/search?q={q}", "https://openlibrary.org", False),
-    "hathitrust": ("HathiTrust", "https://babel.hathitrust.org/cgi/ls?q1={q}", "https://www.hathitrust.org", True),
+    "gutenberg": ("Project Gutenberg", "https://www.gutenberg.org/ebooks/search/?query={q}", "https://www.gutenberg.org", False, "free"),
+    "bookshare": ("Bookshare", "https://www.bookshare.org/search?keyword={q}", "https://www.bookshare.org", True, "free"),
+    "bard": ("NLS BARD", "", "https://nlsbard.loc.gov", True, "free"),
+    "learningally": ("Learning Ally", "", "https://learningally.org", True, "free"),
+    "archive": ("Internet Archive", "https://archive.org/search?query={q}", "https://archive.org", False, "free"),
+    "standardebooks": ("Standard Ebooks", "https://standardebooks.org/ebooks?query={q}", "https://standardebooks.org", False, "free"),
+    "openlibrary": ("Open Library", "https://openlibrary.org/search?q={q}", "https://openlibrary.org", False, "free"),
+    "hathitrust": ("HathiTrust", "https://babel.hathitrust.org/cgi/ls?q1={q}", "https://www.hathitrust.org", True, "free"),
+    "audible": ("Audible", "https://www.audible.com/search?keywords={q}", "https://www.audible.com", False, "commercial"),
+    "librofm": ("Libro.fm", "https://libro.fm/search?q={q}", "https://libro.fm", False, "commercial"),
+    "kindle": ("Kindle Store on Amazon", "https://www.amazon.com/s?k={q}&i=digital-text", "https://www.amazon.com", False, "commercial"),
+    "applebooks": ("Apple Books", "https://books.apple.com/us/search?term={q}", "https://books.apple.com", False, "commercial"),
+    "kobo": ("Kobo", "https://www.kobo.com/us/en/search?query={q}", "https://www.kobo.com", False, "commercial"),
+    "googleplay": ("Google Play Books", "https://play.google.com/store/search?q={q}&c=books", "https://play.google.com/store/books", False, "commercial"),
+    "barnesnoble": ("Barnes and Noble", "https://www.barnesandnoble.com/s/{q}", "https://www.barnesandnoble.com", False, "commercial"),
+    "bookshop": ("Bookshop.org", "https://bookshop.org/search?keywords={q}", "https://bookshop.org", False, "commercial"),
+    "libby": ("Libby and OverDrive", "", "https://libbyapp.com", True, "library"),
+    "hoopla": ("Hoopla", "https://www.hoopladigital.com/search?q={q}", "https://www.hoopladigital.com", True, "library"),
 }
 
 
-def enabled_services(setting_value: str) -> list[str]:
-    """Services chosen in settings, in a fixed order. An unset value means all."""
+def services_in_group(group: str) -> list[str]:
+    return [key for key, value in SERVICES.items() if value[4] == group]
+
+
+def enabled_services(setting_value: str, group: str = "free") -> list[str]:
+    """Services chosen in settings for a group, in a fixed order. An unset value means all."""
+    members = services_in_group(group)
     if not (setting_value or "").strip():
-        return list(SERVICES)
+        return members
     chosen = {part.strip() for part in setting_value.split(",")}
-    return [key for key in SERVICES if key in chosen]
+    return [key for key in members if key in chosen]
 
 
 def search_words(title: str, author: str = "") -> str:
@@ -56,9 +82,12 @@ def search_words(title: str, author: str = "") -> str:
     return re.sub(r"\s+", " ", words)
 
 
-def service_target(key: str, words: str) -> tuple[str, str, bool]:
+def service_target(key: str, words: str, library_key: str = "") -> tuple[str, str, bool]:
     """Return (address to open, label, whether the search words must be pasted by hand)."""
-    label, template, site, _account = SERVICES[key]
+    label, template, site, _account, _group = SERVICES[key]
+    if key == "libby" and library_key.strip():
+        name = re.sub(r"[^a-z0-9\-]", "", library_key.strip().casefold())
+        return f"https://{name}.overdrive.com/search?query={urllib.parse.quote_plus(words)}", label, False
     if template:
         return template.format(q=urllib.parse.quote_plus(words)), label, False
     return site, label, True

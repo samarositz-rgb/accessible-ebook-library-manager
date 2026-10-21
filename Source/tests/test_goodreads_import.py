@@ -104,13 +104,22 @@ class WishlistTests(unittest.TestCase):
         rows = self.db.all_books_for_duplicate_check()
         self.assertEqual(len(rows), 3)
         dune = next(r for r in rows if r[1].startswith("Dune"))
-        self.assertIn("Wishlist", dune[4])
+        self.assertIn("No File Available", dune[4])
         self.assertIn("favorites", dune[4])
         self.assertTrue(gr.is_wishlist_path(dune[8]))
         self.assertEqual(dune[12], "9780441172719")
         second = gr.apply_goodreads_entries(self.db, self.entries)
         self.assertEqual(second["unmatched"], 0)
         self.assertEqual(len(self.db.all_books_for_duplicate_check()), 3)
+
+    def test_old_wishlist_tag_is_renamed(self):
+        gr.apply_goodreads_entries(self.db, self.entries)
+        gr.add_wishlist_entries(self.db, self.entries)
+        row = self.db.all_books_for_duplicate_check()[0]
+        self.db.update_book(row[0], row[1], row[2], row[3], "Wishlist, favorites", row[5])
+        self.assertEqual(gr.rename_legacy_wishlist_tags(self.db), 1)
+        self.assertEqual(self.db.get_book(row[0])[4], "No File Available, favorites")
+        self.assertEqual(gr.rename_legacy_wishlist_tags(self.db), 0)
 
     def test_unmatched_file_lists_titles(self):
         out = Path(self.tmp) / "missing.txt"

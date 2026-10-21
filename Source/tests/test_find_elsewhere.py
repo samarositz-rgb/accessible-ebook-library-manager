@@ -16,11 +16,20 @@ FEED = """<?xml version="1.0" encoding="utf-8"?>
 
 
 class FindElsewhereTests(unittest.TestCase):
-    def test_unset_means_all_services(self):
-        self.assertEqual(fe.enabled_services(""), list(fe.SERVICES))
+    def test_unset_means_all_services_in_the_group(self):
+        self.assertEqual(fe.enabled_services(""), fe.services_in_group("free"))
+        self.assertIn("audible", fe.enabled_services("", "commercial"))
+        self.assertEqual(fe.enabled_services("", "library"), ["libby", "hoopla"])
 
-    def test_chosen_services_keep_fixed_order(self):
-        self.assertEqual(fe.enabled_services("bard, gutenberg, bogus"), ["gutenberg", "bard"])
+    def test_chosen_services_keep_fixed_order_and_stay_in_group(self):
+        self.assertEqual(fe.enabled_services("bard, gutenberg, bogus, audible"), ["gutenberg", "bard"])
+
+    def test_commercial_and_library_addresses(self):
+        self.assertEqual(fe.service_target("audible", "Dune Herbert")[0], "https://www.audible.com/search?keywords=Dune+Herbert")
+        self.assertEqual(fe.service_target("libby", "Dune Herbert", "nypl")[0], "https://nypl.overdrive.com/search?query=Dune+Herbert")
+        url, _label, paste = fe.service_target("libby", "Dune Herbert", "")
+        self.assertEqual(url, "https://libbyapp.com")
+        self.assertTrue(paste)
 
     def test_search_words_drop_subtitle_and_use_last_name(self):
         self.assertEqual(fe.search_words("Dune (Dune, #1)", "Frank Herbert"), "Dune Herbert")

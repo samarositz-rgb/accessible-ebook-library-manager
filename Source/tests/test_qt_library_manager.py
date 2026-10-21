@@ -1691,7 +1691,7 @@ class QtLibraryManagerTests(unittest.TestCase):
         with patch.object(self.window, "selected_row", return_value=self.window.db.get_book(book_id)), \
                 patch("qt_library_manager.search_gutenberg", return_value=hit), \
                 patch.object(QDialog, "exec", new=capture):
-            self.window.find_book_elsewhere()
+            self.window.find_book_elsewhere("free")
         self.assertTrue(any(text.startswith("Project Gutenberg, free download") for text in seen))
         self.assertTrue(any(text.startswith("NLS BARD") and "copied" in text for text in seen))
         self.assertTrue(any(text.startswith("Bookshare") for text in seen))
@@ -1714,8 +1714,8 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(titles(), {"Wish Book"})
         self.window.set_file_access_filter("")
         self.assertEqual(titles(), {"Owned Book", "Wish Book"})
-        self.assertIn("Wishlist, no book file", self.window.row_text(self.window.db.search_books("Wish")[0]))
-        self.assertNotIn("Wishlist", self.window.row_text(self.window.db.search_books("Owned")[0]))
+        self.assertIn("No file available", self.window.row_text(self.window.db.search_books("Wish")[0]))
+        self.assertNotIn("No file available", self.window.row_text(self.window.db.search_books("Owned")[0]))
         self.assertTrue(owned and wish)
 
     def test_find_services_choice_is_saved(self):
@@ -1728,6 +1728,7 @@ class QtLibraryManagerTests(unittest.TestCase):
         with patch.object(QDialog, "exec", new=choose):
             self.window.choose_find_services()
         self.assertEqual(self.window.db.get_setting("find_elsewhere_services", ""), "gutenberg,bookshare")
+        self.assertEqual(self.window.db.get_setting("find_commercial_services", ""), "none")
 
 
 if __name__ == "__main__":

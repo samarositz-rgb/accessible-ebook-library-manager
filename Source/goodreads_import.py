@@ -139,7 +139,8 @@ def apply_goodreads_entries(db, entries: list[dict], books: list | None = None) 
     return result
 
 
-WISHLIST_TAG = "Wishlist"
+WISHLIST_TAG = "No File Available"
+LEGACY_WISHLIST_TAG = "Wishlist"
 WISHLIST_PREFIX = "wishlist:goodreads:"
 
 
@@ -154,7 +155,7 @@ def wishlist_key(entry: dict) -> str:
 
 
 def add_wishlist_entries(db, entries: list[dict]) -> int:
-    """Add books that have no file yet, tagged Wishlist. Returns how many were added."""
+    """Add books that have no file yet, tagged No File Available. Returns how many were added."""
     added = 0
     for entry in entries:
         key = wishlist_key(entry)
@@ -189,3 +190,15 @@ def write_unmatched_file(path, entries: list[dict]) -> None:
         lines.append(line)
     with open(path, "w", encoding="utf-8", newline="\r\n") as handle:
         handle.write("\n".join(lines) + "\n")
+
+
+def rename_legacy_wishlist_tags(db) -> int:
+    """Rename the old Wishlist tag to No File Available. Returns how many books changed."""
+    changed = 0
+    for row in db.all_books_for_duplicate_check():
+        tags = [t.strip() for t in (row[4] or "").split(",") if t.strip()]
+        if LEGACY_WISHLIST_TAG.casefold() in {t.casefold() for t in tags} and is_wishlist_path(row[8]):
+            renamed = [WISHLIST_TAG if t.casefold() == LEGACY_WISHLIST_TAG.casefold() else t for t in tags]
+            db.update_book(row[0], row[1], row[2], row[3], merge_tags("", renamed), row[5])
+            changed += 1
+    return changed

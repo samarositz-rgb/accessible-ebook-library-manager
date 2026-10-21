@@ -37,18 +37,24 @@ Backups include the library database and imported book files. Watched folders ar
 
 Goodreads and online lookup
 
-File > Import Goodreads Export reads the CSV file from Goodreads (My Books, Import and export, Export Library). For books already in your library it adds your shelves as tags and records your rating, reading status, date finished and review in the notes. Your own notes are kept. Goodreads books that are not in your library are added as entries tagged Wishlist, with no book file, and you are offered a text file listing them so you can look for them elsewhere. Run the import again after adding files and the entries are matched and updated rather than duplicated. Goodreads books that are not in your library are added as entries tagged Wishlist, with no book file, and you are offered a text file listing them so you can look for them elsewhere. Run the import again after adding files and the entries are matched and updated rather than duplicated. Nothing is sent to Goodreads.
-
-Audiobooks and exporting to Goodreads
-
-File > Import Audiobook Folder reads a folder of M4B files, such as your Libation library, including its subfolders. Titles, authors, narrators and years come from the tags inside each file, or from the Libation folder and file names. A wishlist book with the same title and author is linked to its audiobook instead of being duplicated. Anything else is added with the tag Audiobook. The files are never copied or changed, and removing a book from the library never deletes them. Run it again after Libation downloads more books.
+File > Import Goodreads Export reads the CSV file from Goodreads (My Books, Import and export, Export Library). For books already in your library it adds your shelves as tags and records your rating, reading status, date finished and review in the notes. Your own notes are kept. Goodreads books that are not in your library are added with the tag No File Available and no book file, and you are offered a text file listing them so you can look for them elsewhere. Run the import again after adding files and the entries are matched and updated rather than duplicated. Nothing is sent to Goodreads.
 
 File > Export Library for Goodreads saves a CSV file with titles, authors, ISBNs, shelves, ratings, reading status, dates and reviews. Goodreads does not let other programs add books directly, so on Goodreads choose My Books, Import and export, Import, and select the file. You are asked whether to include books that have no reading status; Goodreads puts those on To Read.
 
+Online metadata lookup tries Open Library, Google Books and the Open Library ISBN record, and fills blank fields from each source.
+
+Audiobooks
+
+File > Import Audiobook Folder reads a folder of M4B files, such as your Libation library, including its subfolders. Titles, authors, narrators and years come from the tags inside each file, or from the Libation folder and file names. A No File Available book with the same title and author is linked to its audiobook instead of being duplicated. Anything else is added with the tag Audiobook. The files are never copied or changed, and removing a book from the library never deletes them. Run it again after Libation downloads more books.
+
 Books you have and books you do not
 
-A book with no file in your library, such as a Goodreads wishlist entry, is read out with the words Wishlist, no book file at the end. Organize > Filter has three choices: Show Only Books I Have, Show Only Books I Do Not Have (wishlist entries and books whose file has gone missing), and Show Books Whether or Not I Have Them. The filter is also stored in saved views, and Clear Filters resets it.
+A book with no file in your library is read out with the words No file available at the end. Organize > Filter has three choices: Show Only Books I Have, Show Only Books I Do Not Have (No File Available entries and books whose file has gone missing), and Show Books Whether or Not I Have Them. The filter is also stored in saved views, and Clear Filters resets it.
 
-Finding books on free and accessible services
+Finding a book elsewhere
 
-Book > Find Book on Free and Accessible Services lists places to look for the selected book, which suits Wishlist entries. Project Gutenberg is searched for you and matching free books are listed. Bookshare, Internet Archive, Standard Ebooks, Open Library and HathiTrust open a search page in your browser. NLS BARD and Learning Ally have no public search address, so the app opens their site and copies the search words for you to paste after you sign in. Press Enter on a line, or choose Open. Book > Choose Services for Finding Books picks which services appear. The app never handles your logins and downloads nothing. Online metadata lookup now tries Open Library, Google Books and the Open Library ISBN record, and fills blank fields from each source.
+The Book menu has three searches for the selected book. Each lists the services chosen for it, and Open All Searches opens every one in your browser at once. Press Enter on a line, or choose Open Selected, to open just that one.
+Find Book on Free and Accessible Services covers Project Gutenberg (searched for you inside the app), Bookshare, NLS BARD, Learning Ally, Internet Archive, Standard Ebooks, Open Library and HathiTrust.
+Find Book on Commercial Services covers Audible, Libro.fm, the Kindle Store on Amazon, Apple Books, Kobo, Google Play Books, Barnes and Noble and Bookshop.org.
+Find Book at My Library covers Libby and OverDrive, and Hoopla.
+NLS BARD and Learning Ally have no public search address, so the app opens their site and copies the search words for you to paste after you sign in. For Libby, enter your library's name in the services dialog, such as nypl for nypl.overdrive.com, and the search goes straight to your library. Book > Choose Services for Finding Books picks which services appear in each search. The app never handles your logins, buys nothing and downloads nothing.

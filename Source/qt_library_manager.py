@@ -105,8 +105,8 @@ from document_text import extract_text_for_indexing
 from book_flags import IMAGE_ONLY_PDF, describe_flags, index_book_file
 from audiobook_scan import import_audiobooks, scan_audiobook_folder
 from goodreads_export import export_goodreads_csv
-from find_elsewhere import SERVICES as FIND_SERVICES, SETTING_KEY as FIND_SERVICES_SETTING, enabled_services, search_gutenberg, search_words, service_target
-from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, write_unmatched_file
+from find_elsewhere import GROUP_SETTINGS as FIND_GROUP_SETTINGS, GROUP_TITLES as FIND_GROUP_TITLES, LIBRARY_KEY_SETTING as FIND_LIBRARY_SETTING, SERVICES as FIND_SERVICES, enabled_services, search_gutenberg, search_words, service_target, services_in_group
+from goodreads_import import add_wishlist_entries, apply_goodreads_entries, is_wishlist_path, parse_goodreads_csv, rename_legacy_wishlist_tags, write_unmatched_file
 from help_file import ensure_user_help, load_help_text
 from library_utils import (
     metadata_score_from_row,
@@ -2110,6 +2110,10 @@ class QtLibraryWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db = LibraryDatabase()
+        try:
+            rename_legacy_wishlist_tags(self.db)
+        except Exception:
+            pass
         self.setStatusBar(ReviewableStatusBar(self))
         self.setWindowTitle(APP_NAME)
         self.resize(1120, 760)
@@ -2231,7 +2235,9 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(book_menu, "Bulk Edit Selected Metadata...", self.bulk_edit_metadata)
         self.add_action(book_menu, "Find Missing Metadata Wizard...", self.auto_detect_metadata, "Ctrl+D")
         self.add_action(book_menu, "Look Up Metadata Online...", self.lookup_metadata_online)
-        self.add_action(book_menu, "Find Book on Free and Accessible Services...", self.find_book_elsewhere)
+        self.add_action(book_menu, "Find Book on Free and Accessible Services...", lambda: self.find_book_elsewhere("free"))
+        self.add_action(book_menu, "Find Book on Commercial Services...", lambda: self.find_book_elsewhere("commercial"))
+        self.add_action(book_menu, "Find Book at My Library (Libby, Hoopla)...", lambda: self.find_book_elsewhere("library"))
         self.add_action(book_menu, "Choose Services for Finding Books...", self.choose_find_services)
         repair_menu = book_menu.addMenu("Repair")
         self.add_action(repair_menu, "Cleanup and Repair Wizard...", self.cleanup_repair_wizard)
@@ -2539,7 +2545,7 @@ class QtLibraryWindow(QMainWindow):
 
     @staticmethod
     def row_has_book_file(row):
-        """True when the book's file is in the library. Wishlist entries never are."""
+        """True when the book's file is in the library. No File Available entries never are."""
         stored = row[13] if len(row) > 13 else ""
         return bool(stored) and not is_wishlist_path(stored) and Path(stored).is_file()
 
@@ -2549,7 +2555,7 @@ class QtLibraryWindow(QMainWindow):
         self.refresh_books()
         message = {
             "have": "Showing only books you have.",
-            "missing": "Showing only books you do not have: wishlist entries and books whose file is missing.",
+            "missing": "Showing only books you do not have: No File Available entries and books whose file is missing.",
         }.get(mode, "Showing all books, whether or not you have them.")
         self.routine_feedback(message)
 
@@ -2748,7 +2754,7 @@ class QtLibraryWindow(QMainWindow):
         }
         text = ". ".join(str(fields[key] or f"No {key.replace('_', ' ')}") for key in self.speech_fields())
         if len(row) > 13 and is_wishlist_path(row[13]):
-            text += ". Wishlist, no book file"
+            text += ". No file available"
         return text
 
     def refresh_books(self, selected_id=None, focus_books=True):
@@ -3073,7 +3079,7 @@ class QtLibraryWindow(QMainWindow):
         if not row:
             return
         if is_wishlist_path(row[8]):
-            QMessageBox.information(self, "Wishlist Entry", "This book came from Goodreads and has no book file in your library yet. Add the book file to read it.")
+            QMessageBox.information(self, "No File Available", "This book is in your library without a book file yet. Add the file to read it.")
             return
         path = Path(row[8])
         if not path.exists():
@@ -4229,28 +4235,38 @@ class QtLibraryWindow(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle("Services for Finding Books")
         layout = QVBoxLayout(dialog)
-        current = enabled_services(self.db.get_setting(FIND_SERVICES_SETTING, ""))
         boxes = {}
-        for key, (label, _template, _site, account) in FIND_SERVICES.items():
-            box = QCheckBox(label + (" (needs your member login)" if account else ""), dialog)
-            box.setChecked(key in current)
-            layout.addWidget(box)
-            boxes[key] = box
+        for group, title in FIND_GROUP_TITLES.items():
+            layout.addWidget(QLabel(title, dialog))
+            current = enabled_services(self.db.get_setting(FIND_GROUP_SETTINGS[group], ""), group)
+            for key in services_in_group(group):
+                label, _template, _site, account, _group = FIND_SERVICES[key]
+                box = QCheckBox(label + (" (needs your member login)" if account else ""), dialog)
+                box.setChecked(key in current)
+                layout.addWidget(box)
+                boxes[key] = box
+        layout.addWidget(QLabel("Your library's Libby or OverDrive name, such as nypl for nypl.overdrive.com. Leave blank to open the Libby site instead.", dialog))
+        library_name = QLineEdit(self.db.get_setting(FIND_LIBRARY_SETTING, ""), dialog)
+        library_name.setAccessibleName("Library Libby or OverDrive name")
+        layout.addWidget(library_name)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            chosen = [key for key, box in boxes.items() if box.isChecked()]
-            self.db.set_setting(FIND_SERVICES_SETTING, ",".join(chosen) if chosen else "none")
+            for group in FIND_GROUP_TITLES:
+                chosen = [key for key in services_in_group(group) if boxes[key].isChecked()]
+                self.db.set_setting(FIND_GROUP_SETTINGS[group], ",".join(chosen) if chosen else "none")
+            self.db.set_setting(FIND_LIBRARY_SETTING, library_name.text().strip())
             self.routine_feedback("Services for finding books saved.")
 
-    def find_book_elsewhere(self):
+    def find_book_elsewhere(self, group="free"):
         row = self.selected_row()
         if not row:
             return
         words = search_words(row[1], row[2])
-        services = enabled_services(self.db.get_setting(FIND_SERVICES_SETTING, ""))
+        services = enabled_services(self.db.get_setting(FIND_GROUP_SETTINGS[group], ""), group)
+        library_key = self.db.get_setting(FIND_LIBRARY_SETTING, "")
         entries = []
         problem = ""
         if "gutenberg" in services:
@@ -4262,17 +4278,19 @@ class QtLibraryWindow(QMainWindow):
                 problem = f"Project Gutenberg could not be searched: {exc}"
             finally:
                 QApplication.restoreOverrideCursor()
+        pages = []
         for key in services:
-            url, label, paste = service_target(key, words)
+            url, label, paste = service_target(key, words, library_key)
+            pages.append((url, words if paste else ""))
             if paste:
                 entries.append((f"{label}: open the site and search for {words}. The search words are copied for you to paste.", url, words))
-            elif key != "gutenberg" or not entries:
+            else:
                 entries.append((f"{label}: search for {words}", url, ""))
-        if not entries:
-            QMessageBox.information(self, "Find Book", "No services are chosen. Use Book, Choose Services for Finding Books.")
+        if not services:
+            QMessageBox.information(self, "Find Book", "No services are chosen in this group. Use Book, Choose Services for Finding Books.")
             return
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Find {row[1]} Elsewhere")
+        dialog.setWindowTitle(f"Find {row[1]}: {FIND_GROUP_TITLES[group]}")
         dialog.resize(700, 420)
         layout = QVBoxLayout(dialog)
         results = QListWidget(dialog)
@@ -4297,9 +4315,18 @@ class QtLibraryWindow(QMainWindow):
                 QApplication.clipboard().setText(paste)
             QDesktopServices.openUrl(QUrl(url))
 
+        def open_all():
+            for url, paste in pages:
+                if paste:
+                    QApplication.clipboard().setText(paste)
+                QDesktopServices.openUrl(QUrl(url))
+            self.routine_feedback(f"Opened {len(pages)} searches in your browser.")
+
         results.itemActivated.connect(lambda _item: open_current())
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        open_button = buttons.addButton("Open", QDialogButtonBox.ButtonRole.ActionRole)
+        open_all_button = buttons.addButton("Open All Searches", QDialogButtonBox.ButtonRole.ActionRole)
+        open_all_button.clicked.connect(open_all)
+        open_button = buttons.addButton("Open Selected", QDialogButtonBox.ButtonRole.ActionRole)
         open_button.clicked.connect(open_current)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -4310,7 +4337,7 @@ class QtLibraryWindow(QMainWindow):
         include_all = QMessageBox.question(
             self, "Export for Goodreads",
             "Include books that have no reading status yet? Goodreads will place them on its To Read shelf. "
-            "Choose No to export only wishlist books and books with a status from an earlier Goodreads import.",
+            "Choose No to export only No File Available books and books with a status from an earlier Goodreads import.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes
@@ -4343,7 +4370,7 @@ class QtLibraryWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.refresh_books()
         message = (
-            f"Found {len(items)} audiobooks. {result['added']} added, {result['linked']} matched to wishlist books, "
+            f"Found {len(items)} audiobooks. {result['added']} added, {result['linked']} matched to books that had no file, "
             f"{result['already_linked']} already in the library, {result['already_have']} skipped because you already have that book."
         )
         QMessageBox.information(
@@ -4368,7 +4395,7 @@ class QtLibraryWindow(QMainWindow):
         self.refresh_books()
         message = (
             f"Goodreads import finished. {result['updated']} updated, {result['unchanged']} already current, "
-            f"{wishlisted} added to your library as Wishlist entries with no book file."
+            f"{wishlisted} added to your library as No File Available entries."
         )
         saved = ""
         if result["unmatched_entries"]:

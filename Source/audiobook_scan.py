@@ -2,7 +2,7 @@
 
 Audiobook files are large, so they are linked where they are and never copied or
 changed. Removing a book from the library never deletes a linked file. If a book
-is already in the library as a wishlist entry, the entry is linked to the file
+is already in the library as a No File Available entry, the entry is linked to the file
 rather than duplicated.
 """
 
