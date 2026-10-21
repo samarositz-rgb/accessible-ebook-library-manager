@@ -352,9 +352,14 @@ def _append_note(existing: str, addition: str) -> str:
     return (existing + "\n" if existing else "") + addition
 
 
-def import_audiobooks(db, items: list[dict], books: list | None = None) -> dict:
-    """Link audiobooks into the library. Returns counts of added, linked and skipped."""
-    books = list(books if books is not None else db.all_books_for_duplicate_check())
+def import_audiobooks(db, items: list[dict], books: list | None = None, dry_run: bool = False) -> dict:
+    """Link audiobooks into the library. Returns counts of added, linked and skipped.
+
+    With dry_run the library is not changed, so the counts can be shown as a preview.
+    A book that appears twice in the same scan, for example as an M4B and as a ZIP,
+    is only added once.
+    """
+    books = [list(row) for row in (books if books is not None else db.all_books_for_duplicate_check())]
     result = {"added": 0, "linked": 0, "already_linked": 0, "already_have": 0}
     known_paths = {row[8] for row in books}
     for item in items:
@@ -364,19 +369,27 @@ def import_audiobooks(db, items: list[dict], books: list | None = None) -> dict:
         entry = {"title": item["title"], "author": item["author"], "isbn": "", "isbn10": ""}
         row = find_match(entry, books)
         if row is not None and is_wishlist_path(row[8]):
-            db.link_book_file(row[0], item["path"], item_format(item))
-            db.update_book(row[0], row[1], row[2], row[3], merge_tags(row[4], [AUDIOBOOK_TAG]),
-                           _append_note(row[5], audiobook_note(item)))
+            if not dry_run:
+                db.link_book_file(row[0], item["path"], item_format(item))
+                db.update_book(row[0], row[1], row[2], row[3], merge_tags(row[4], [AUDIOBOOK_TAG]),
+                               _append_note(row[5], audiobook_note(item)))
+            row[8] = item["path"]
             known_paths.add(item["path"])
             result["linked"] += 1
         elif row is not None:
             result["already_have"] += 1
         else:
-            book_id = db.add_book(item["title"], item["author"], item["source"], "", "", item["path"], item["path"])
-            db.link_book_file(book_id, item["path"], item_format(item))
-            db.update_book(book_id, item["title"], item["author"], item["source"], AUDIOBOOK_TAG, audiobook_note(item))
-            if item["year"]:
-                db.update_extra_fields(book_id, year=item["year"])
+            book_id = -1
+            if not dry_run:
+                book_id = db.add_book(item["title"], item["author"], item["source"], "", "", item["path"], item["path"])
+                db.link_book_file(book_id, item["path"], item_format(item))
+                db.update_book(book_id, item["title"], item["author"], item["source"], AUDIOBOOK_TAG, audiobook_note(item))
+                if item["year"]:
+                    db.update_extra_fields(book_id, year=item["year"])
+            fresh = [None] * 23
+            fresh[0], fresh[1], fresh[2], fresh[3], fresh[4], fresh[5] = book_id, item["title"], item["author"], item["source"], AUDIOBOOK_TAG, ""
+            fresh[8], fresh[12] = item["path"], ""
+            books.append(fresh)
             known_paths.add(item["path"])
             result["added"] += 1
     return result

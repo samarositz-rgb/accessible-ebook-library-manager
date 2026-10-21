@@ -112,6 +112,44 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.all_books_for_duplicate_check(), [])
 
 
+class DuplicateMatchingTests(unittest.TestCase):
+    def match(self, gr_title, gr_author, lib_title, lib_author):
+        entry = {"title": gr_title, "author": gr_author, "isbn": "", "isbn10": ""}
+        row = [None] * 23
+        row[0], row[1], row[2], row[8], row[12] = 1, lib_title, lib_author, "x", ""
+        return gr.find_match(entry, [row]) is not None
+
+    def test_audible_style_titles_match_goodreads_titles(self):
+        self.assertTrue(self.match("The Hunger Games (The Hunger Games, #1)", "Suzanne Collins", "The Hunger Games, Book 1", "Suzanne Collins"))
+        self.assertTrue(self.match("Dune (Dune, #1)", "Frank Herbert", "Dune (Unabridged)", "Frank Herbert"))
+        self.assertTrue(self.match("Atomic Habits: Tiny Changes, Remarkable Results", "James Clear", "Atomic Habits", "James Clear"))
+        self.assertTrue(self.match("Emma", "Jane Austen", "Emma, Unabridged", "Austen, Jane"))
+
+    def test_authors_in_different_order_or_lists_still_match(self):
+        self.assertTrue(self.match("Good Omens", "Terry Pratchett", "Good Omens", "Neil Gaiman, Terry Pratchett"))
+        self.assertTrue(self.match("The Shining", "Stephen King", "The Shining", "King, Stephen"))
+        self.assertTrue(self.match("Harry Potter and the Sorcerer's Stone", "J.K. Rowling", "Harry Potter and the Sorcerer's Stone", "J. K. Rowling"))
+
+    def test_different_books_or_authors_do_not_match(self):
+        self.assertFalse(self.match("Dune", "Frank Herbert", "Dune Messiah", "Frank Herbert"))
+        self.assertFalse(self.match("It", "Stephen King", "It", "Someone Else"))
+        self.assertFalse(self.match("Dune", "John Smith", "Dune", "John Jones"))
+
+
+class ScanPreviewTests(DatabaseTests):
+    def test_dry_run_changes_nothing_and_counts_match_real_run(self):
+        make_m4b(self.root / "Frank Herbert" / "Dune.m4b", "Dune (Unabridged)", "Frank Herbert")
+        make_m4b(self.root / "Frank Herbert" / "Copy" / "Dune again.m4b", "Dune", "Frank Herbert")
+        make_m4b(self.root / "Andy Weir" / "Hail Mary.m4b", "Project Hail Mary", "Andy Weir")
+        items = ab.scan_audiobook_folder(self.root)
+        before = len(self.db.all_books_for_duplicate_check())
+        preview = ab.import_audiobooks(self.db, items, dry_run=True)
+        self.assertEqual(len(self.db.all_books_for_duplicate_check()), before)
+        real = ab.import_audiobooks(self.db, items)
+        self.assertEqual(preview, real)
+        self.assertEqual((real["added"], real["already_have"]), (2, 1))
+
+
 class ExportTests(unittest.TestCase):
     def row(self, **kw):
         row = [None] * 23

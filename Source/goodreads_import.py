@@ -21,12 +21,39 @@ def clean_isbn(value: str) -> str:
     return re.sub(r"[^0-9Xx]", "", value or "").upper()
 
 
+EDITION_WORDS = re.compile(
+    r"[,\-–]?\s*\b(unabridged|abridged|a novel|(?:book|volume|vol\.?|part)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten))\b\s*$"
+)
+
+
 def title_key(value: str) -> str:
     text = re.sub(r"\(.*?\)", " ", (value or "").casefold())
     text = text.split(":")[0].strip()
     text = re.sub(r"^(the|a|an)\s+", "", text)
     text = re.sub(r",\s*(the|a|an)$", "", text)
+    previous = None
+    while previous != text:  # "Title, Book 1, Unabridged" loses both endings
+        previous = text
+        text = EDITION_WORDS.sub("", text).strip(" ,-")
     return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def author_last_names(value: str) -> set[str]:
+    """Last names of every author, for 'First Last', 'Last, First' and lists of either."""
+    text = re.sub(r"\([^)]*\)", " ", value or "")
+    pieces = [piece.strip() for piece in re.split(r"\band\b|;|&", text) if piece.strip()]
+    names: set[str] = set()
+    for piece in pieces:
+        parts = [part.strip() for part in piece.split(",") if part.strip()]
+        if len(parts) == 2 and len(parts[0].split()) == 1:
+            candidates = [parts[0]]  # "Herbert, Frank"
+        else:
+            candidates = [part.split()[-1] for part in parts if part.split()]
+        for candidate in candidates:
+            word = re.sub(r"[^a-z]", "", candidate.casefold())
+            if len(word) > 1:
+                names.add(word)
+    return names
 
 
 def author_key(value: str) -> str:
@@ -111,9 +138,9 @@ def find_match(entry: dict, books: list):
         if isbn and isbn in isbns:
             return row
     wanted_title = title_key(entry["title"])
-    wanted_author = author_key(entry["author"])
+    wanted_authors = author_last_names(entry["author"])
     for row in books:
-        if title_key(row[1]) == wanted_title and (not wanted_author or author_key(row[2]) == wanted_author):
+        if title_key(row[1]) == wanted_title and (not wanted_authors or wanted_authors & author_last_names(row[2])):
             return row
     return None
 

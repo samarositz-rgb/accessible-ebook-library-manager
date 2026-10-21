@@ -4441,6 +4441,23 @@ class QtLibraryWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             items = scan_audiobook_folder(folder)
+            preview = import_audiobooks(self.db, items, dry_run=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not items:
+            QMessageBox.information(self, "Audiobook Import", "No audiobooks were found in that folder.")
+            return
+        answer = QMessageBox.question(
+            self, "Audiobook Import",
+            f"Found {len(items)} audiobooks. If you continue, {preview['linked']} will be matched to books in your library that have no file, "
+            f"{preview['added']} will be added as new books, {preview['already_have']} will be skipped because you already have that book, "
+            f"and {preview['already_linked']} are already in the library. Nothing is copied or changed. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
             result = import_audiobooks(self.db, items)
         finally:
             QApplication.restoreOverrideCursor()
