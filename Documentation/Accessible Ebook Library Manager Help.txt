@@ -43,6 +43,13 @@ File > Export Library for Goodreads saves a CSV file with titles, authors, ISBNs
 
 Online metadata lookup tries Open Library, Google Books and the Open Library ISBN record, and fills blank fields from each source.
 
+Kindle books
+
+File > Scan Kindle Folder for Books looks at your Kindle for PC download folder, usually called My Kindle Content in Documents. The first time, the app suggests the folder it found, or you can choose it with File > Choose Kindle Folder. Once a folder is saved, the app checks it quietly a short while after it starts and tells you if new books appear.
+Only the title, author and Amazon ID at the start of each file are read. The protected book itself is never read, copied or opened, and nothing is removed from it. Each Kindle book that is not in your library is added as a No File Available entry tagged On Kindle. Books already in your library, for example from Goodreads, are matched and tagged instead of duplicated.
+The app then checks Project Gutenberg and Open Library by itself. When it finds a free copy, or one that can be borrowed or is available to readers with print disabilities, the book gets the tag Free Copy Found and the link is added to its notes. Bookshare, NLS BARD and Learning Ally need your sign in, so the app cannot check them for you. Select the book and press Control+Shift+F, or choose Book > Find Book on Other Services, then press Enter on Bookshare to open its search in your browser.
+If your Kindle folder is kept in iCloud Drive or OneDrive, Windows may store the files online only. Those files are skipped, and the app tells you how many. In File Explorer, right-click the Kindle folder and choose Always keep on this device, then scan again. Books in the newer Kindle format (KFX) have titles that cannot be read, so they are only counted.
+
 Books you have and books you do not
 
 A book with no file in your library is read out with the words No file available at the end. Organize > Filter has three choices: Show Only Books I Have, Show Only Books I Do Not Have (No File Available entries and books whose file has gone missing), and Show Books Whether or Not I Have Them. The filter is also stored in saved views, and Clear Filters resets it.

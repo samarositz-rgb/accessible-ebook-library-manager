@@ -1678,6 +1678,26 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(self.window.search.selectedText(), "Target")
         self.assertEqual(self.window.marked_ids, {first, second})
 
+    def test_kindle_scan_worker_adds_no_file_entries_with_free_copy_note(self):
+        from qt_library_manager import KindleScanWorker
+        from tests.test_kindle_monitor import make_azw
+        folder = Path(self.profile.name) / "My Kindle Content"
+        make_azw(folder / "B00A_EBOK" / "B00A_EBOK.azw", "Emma", "Jane Austen", "B00A")
+        worker = KindleScanWorker(str(folder))
+        results = []
+        worker.completed.connect(lambda added, issues: results.append((added, issues)))
+        with patch("qt_library_manager.find_free_copies", return_value=["Free copy on Project Gutenberg: https://www.gutenberg.org/ebooks/158."]):
+            worker.run()
+        self.assertEqual(results, [(1, [])])
+        self.window.set_file_access_filter("missing")
+        shown = {self.window.single_list.item(n).data(Qt.ItemDataRole.UserRole + 1) for n in range(self.window.single_list.count())}
+        self.assertEqual(shown, {"Emma"})
+        row = self.window.db.search_books("Emma")[0]
+        self.assertIn("No file available", self.window.row_text(row))
+        full = self.window.db.get_book(row[0])
+        self.assertIn("Free Copy Found", full[4])
+        self.assertIn("gutenberg.org/ebooks/158", full[5])
+
     def test_file_access_filter_separates_owned_and_no_file_books(self):
         real = Path(self.profile.name) / "Owned Book.txt"
         real.write_text("text", encoding="utf-8")

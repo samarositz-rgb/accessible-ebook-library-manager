@@ -117,7 +117,8 @@ from library_utils import (
     sync_folder_contents,
 )
 from calibre_tools import find_calibre_tool
-from online_metadata import lookup_online_metadata
+from online_metadata import fetch_json, lookup_online_metadata
+from kindle_monitor import KINDLE_FOLDER_SETTING, add_kindle_books, candidate_folders, find_free_copies, scan_kindle_folder
 from braille_export import BrailleEngine, BrailleOptions, ExportCancelled, publish_files
 from conversion_warnings import inspect_conversion_risks
 from book_categories import COMMON_TAGS
@@ -1624,6 +1625,39 @@ class ConvertBooksWorker(QThread):
         self.completed.emit(converted, issues)
 
 
+class KindleScanWorker(QThread):
+    progress = Signal(str)
+    completed = Signal(int, list)
+
+    def __init__(self, folder, parent=None):
+        super().__init__(parent)
+        self.folder = folder
+        self.summary = {}
+
+    def run(self):
+        database = None
+        issues = []
+        added = 0
+        try:
+            database = LibraryDatabase()
+            self.progress.emit("Reading the Kindle folder")
+            scan = scan_kindle_folder(self.folder)
+            self.summary = {"found": len(scan["books"]), "unreadable": scan["unreadable"], "online_only": scan["online_only"]}
+
+            def lookup(title, author):
+                return find_free_copies(title, author, fetch_json, search_gutenberg)
+
+            result = add_kindle_books(database, scan["books"], lookup, self.isInterruptionRequested, self.progress.emit)
+            self.summary.update(result)
+            added = result["added"]
+        except Exception as exc:
+            issues.append(str(exc))
+        finally:
+            if database:
+                database.close()
+        self.completed.emit(added, issues)
+
+
 class LibraryOperations:
     """Adapt existing non-UI import and watch-folder routines for Qt workers."""
 
@@ -2207,6 +2241,7 @@ class QtLibraryWindow(QMainWindow):
         self.set_view_mode(self.db.get_setting("book_list_display_mode", "single"), initial=True)
         self.refresh_books()
         QTimer.singleShot(15000, self.check_watched_folders)
+        QTimer.singleShot(30000, self.check_kindle_folder)
         QTimer.singleShot(60 * 60 * 1000, self.check_library_backup)
         if self.db.get_setting("automatic_duplicate_cleanup", "0") == "1":
             QTimer.singleShot(10000, self.automatic_duplicate_cleanup)
@@ -2216,6 +2251,8 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(file_menu, "Add Book...", self.add_book, "Ctrl+N")
         self.add_action(file_menu, "Import Folder...", self.import_folder, "Ctrl+Shift+N")
         self.add_action(file_menu, "Import Goodreads Export...", self.import_goodreads_export)
+        self.add_action(file_menu, "Scan Kindle Folder for Books...", self.scan_kindle_folder_now)
+        self.add_action(file_menu, "Choose Kindle Folder...", self.choose_kindle_folder)
         self.add_action(file_menu, "Export Library for Goodreads...", self.export_library_for_goodreads)
         self.add_action(file_menu, "Open Book", self.open_book, "Ctrl+O")
         self.add_action(file_menu, "Export Book Copy...", self.export_book, "Ctrl+E")
@@ -2233,7 +2270,7 @@ class QtLibraryWindow(QMainWindow):
         self.add_action(book_menu, "Bulk Edit Selected Metadata...", self.bulk_edit_metadata)
         self.add_action(book_menu, "Find Missing Metadata Wizard...", self.auto_detect_metadata, "Ctrl+D")
         self.add_action(book_menu, "Look Up Metadata Online...", self.lookup_metadata_online)
-        self.add_action(book_menu, "Find Book on Other Services...", self.find_book_elsewhere)
+        self.add_action(book_menu, "Find Book on Other Services...", self.find_book_elsewhere, "Ctrl+Shift+F")
         repair_menu = book_menu.addMenu("Repair")
         self.add_action(repair_menu, "Cleanup and Repair Wizard...", self.cleanup_repair_wizard)
         self.add_action(repair_menu, "Check EPUB Accessibility Metadata", self.check_epub_accessibility)
@@ -4983,6 +5020,81 @@ class QtLibraryWindow(QMainWindow):
         paths.setFocus(Qt.FocusReason.OtherFocusReason)
         dialog.exec()
 
+    def choose_kindle_folder(self):
+        guesses = candidate_folders()
+        start = self.db.get_setting(KINDLE_FOLDER_SETTING, "") or (str(guesses[0]) if guesses else "")
+        folder = QFileDialog.getExistingDirectory(self, "Choose Your Kindle for PC Download Folder, usually called My Kindle Content", start)
+        if folder:
+            self.db.set_setting(KINDLE_FOLDER_SETTING, folder)
+            self.routine_feedback("Kindle folder saved.", f"Kindle folder saved: {folder}")
+        return folder
+
+    def scan_kindle_folder_now(self):
+        folder = self.db.get_setting(KINDLE_FOLDER_SETTING, "")
+        if not folder or not Path(folder).is_dir():
+            guesses = candidate_folders()
+            if guesses and QMessageBox.question(
+                self, "Kindle Folder", f"A Kindle folder was found here:\n{guesses[0]}\n\nUse it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+            ) == QMessageBox.StandardButton.Yes:
+                folder = str(guesses[0])
+                self.db.set_setting(KINDLE_FOLDER_SETTING, folder)
+            else:
+                folder = self.choose_kindle_folder()
+        if not folder:
+            return
+        self.start_kindle_scan(folder, quiet=False)
+
+    def check_kindle_folder(self):
+        folder = self.db.get_setting(KINDLE_FOLDER_SETTING, "") if self.db else ""
+        if folder and Path(folder).is_dir() and not (self.active_worker and self.active_worker.isRunning()):
+            self.start_kindle_scan(folder, quiet=True)
+
+    def start_kindle_scan(self, folder, quiet):
+        self.kindle_scan_quiet = quiet
+        if not quiet:
+            self.progress_dialog = QProgressDialog("Scanning the Kindle folder...", "", 0, 0, self)
+            self.progress_dialog.setWindowTitle("Kindle Folder")
+            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress_dialog.setCancelButton(None)
+            self.progress_dialog.show()
+        worker = KindleScanWorker(folder, self)
+        self.active_worker = worker
+        if not quiet:
+            worker.progress.connect(self.progress_dialog.setLabelText)
+        self.connect_worker_result(worker, self.kindle_scan_finished)
+        worker.start()
+
+    def kindle_scan_finished(self, added, issues):
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        summary = getattr(self.active_worker, "summary", {}) or {}
+        if added:
+            self.refresh_books()
+        quiet = getattr(self, "kindle_scan_quiet", False)
+        if quiet and not added and not issues:
+            return
+        parts = [f"Found {summary.get('found', 0)} Kindle books. {added} new, {summary.get('marked', 0)} matched to books already in your library "
+                 f"and {summary.get('already', 0)} already known."]
+        if summary.get("free_found"):
+            parts.append(f"{summary['free_found']} have a free copy available. Filter by the tag Free Copy Found, or open the book's notes.")
+        if added:
+            parts.append("New Kindle books are marked No File Available and On Kindle. Select one and press Control+Shift+F to look for an accessible copy on Bookshare, BARD and other services.")
+        if summary.get("online_only"):
+            parts.append(f"{summary['online_only']} files are stored online only by iCloud or OneDrive and were skipped. "
+                         "In File Explorer, right-click the Kindle folder and choose Always keep on this device, then scan again.")
+        if summary.get("unreadable"):
+            parts.append(f"{summary['unreadable']} books are in a newer Kindle format whose titles cannot be read.")
+        if issues:
+            parts.append("Problem: " + "; ".join(issues))
+        text = " ".join(parts)
+        if quiet:
+            self.routine_feedback(f"Kindle: {added} new books found.", text)
+        else:
+            QMessageBox.information(self, "Kindle Folder", text)
+            self.routine_feedback(parts[0])
+
     def check_watched_folders(self):
         if self._closing or self.db is None:
             return
@@ -5050,7 +5162,7 @@ class QtLibraryWindow(QMainWindow):
         if dialog:
             dialog.operation_worker = worker
             cancellable = isinstance(worker, (ReindexWorker, FolderScanWorker, FolderImportWorker,
-                CombinedPartsWorker, CopyBooksWorker, ExportEpubWorker, ConvertBooksWorker,
+                CombinedPartsWorker, CopyBooksWorker, ExportEpubWorker, ConvertBooksWorker, KindleScanWorker,
                 OnlineMetadataWorker, WatchedFolderWorker))
             if cancellable:
                 dialog.setAutoClose(False)

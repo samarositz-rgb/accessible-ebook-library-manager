@@ -172,7 +172,7 @@ WISHLIST_PREFIX = "wishlist:goodreads:"
 
 
 def is_wishlist_path(stored_path) -> bool:
-    return str(stored_path or "").startswith(WISHLIST_PREFIX)
+    return str(stored_path or "").startswith("wishlist:")
 
 
 def wishlist_key(entry: dict) -> str:
