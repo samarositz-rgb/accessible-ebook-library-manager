@@ -51,7 +51,7 @@ def shelf_name(tag: str) -> str:
     return re.sub(r"[^a-z0-9\-]+", "-", tag.strip().casefold()).strip("-")
 
 
-SKIP_SHELVES.update({shelf_name(WISHLIST_TAG), "wishlist", "audiobook"})
+SKIP_SHELVES.update({shelf_name(WISHLIST_TAG), "wishlist"})
 
 
 def export_row(row, include_without_status: bool = True) -> dict | None:

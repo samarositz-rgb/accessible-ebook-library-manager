@@ -449,17 +449,6 @@ class LibraryDatabase:
         self.connection.commit()
         return cursor.lastrowid
 
-    def link_book_file(self, book_id, path, file_format=None):
-        """Point an existing entry at a file or folder that stays where it is (not copied)."""
-        path = str(path)
-        if file_format is None:
-            file_format = Path(path).suffix.lower().lstrip(".")
-        self.connection.execute(
-            "UPDATE books SET stored_path = ?, original_path = ?, format = ? WHERE id = ?",
-            (path, path, file_format, book_id),
-        )
-        self.connection.commit()
-
     def update_extra_fields(self, book_id, edition="", year="", isbn="", publisher=""):
         self.connection.execute(
             """
@@ -550,8 +539,8 @@ class LibraryDatabase:
         if row and delete_file:
             stored_path = row[8]
             try:
-                # Only files the library copied itself are deleted. Linked files, such
-                # as audiobooks left in a Libation folder, are never touched.
+                # Only files the library copied itself are deleted. Files that are
+                # linked from somewhere else are never touched.
                 inside_library = Path(stored_path).resolve().is_relative_to(self.books_path.resolve())
                 if inside_library and os.path.exists(stored_path):
                     os.remove(stored_path)

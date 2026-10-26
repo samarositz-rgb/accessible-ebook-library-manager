@@ -42,8 +42,6 @@ SERVICES = {
     "standardebooks": ("Standard Ebooks", "https://standardebooks.org/ebooks?query={q}", "https://standardebooks.org", False, "free"),
     "openlibrary": ("Open Library", "https://openlibrary.org/search?q={q}", "https://openlibrary.org", False, "free"),
     "hathitrust": ("HathiTrust", "https://babel.hathitrust.org/cgi/ls?q1={q}", "https://www.hathitrust.org", True, "free"),
-    "audible": ("Audible", "https://www.audible.com/search?keywords={q}", "https://www.audible.com", False, "commercial"),
-    "librofm": ("Libro.fm", "https://libro.fm/search?q={q}", "https://libro.fm", False, "commercial"),
     "kindle": ("Kindle Store on Amazon", "https://www.amazon.com/s?k={q}&i=digital-text", "https://www.amazon.com", False, "commercial"),
     "applebooks": ("Apple Books", "https://books.apple.com/us/search?term={q}", "https://books.apple.com", False, "commercial"),
     "kobo": ("Kobo", "https://www.kobo.com/us/en/search?query={q}", "https://www.kobo.com", False, "commercial"),

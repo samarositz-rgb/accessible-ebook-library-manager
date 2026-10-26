@@ -1678,31 +1678,6 @@ class QtLibraryManagerTests(unittest.TestCase):
         self.assertEqual(self.window.search.selectedText(), "Target")
         self.assertEqual(self.window.marked_ids, {first, second})
 
-    def test_m4b_conversion_worker_links_new_file_and_keeps_originals(self):
-        import subprocess
-        from audiobook_convert import find_ffmpeg
-        from qt_library_manager import AudiobookConvertWorker
-        ffmpeg = find_ffmpeg(os.environ.get("FFMPEG_TEST_PATH", ""))
-        if not ffmpeg:
-            self.skipTest("FFmpeg is not installed")
-        folder = Path(self.profile.name) / "Parts"
-        folder.mkdir()
-        for number in (1, 2):
-            subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1", str(folder / f"{number}.mp3")], check=True)
-        book_id = self.window.db.add_book("Parts Book", "An Author", "", "", "Narrated by A Voice.", str(folder), str(folder))
-        row = self.window.db.get_book(book_id)
-        out = Path(self.profile.name) / "out"
-        worker = AudiobookConvertWorker([row], ffmpeg, out)
-        results = []
-        worker.completed.connect(lambda converted, issues: results.append((converted, issues)))
-        worker.run()
-        self.assertEqual(results, [(1, [])])
-        updated = self.window.db.get_book(book_id)
-        self.assertTrue(updated[8].endswith(".m4b") and Path(updated[8]).is_file())
-        self.assertEqual(updated[6], "m4b")
-        self.assertIn("The original files were kept", updated[5])
-        self.assertTrue((folder / "1.mp3").exists())
-
     def test_file_access_filter_separates_owned_and_no_file_books(self):
         real = Path(self.profile.name) / "Owned Book.txt"
         real.write_text("text", encoding="utf-8")
@@ -1732,7 +1707,7 @@ class QtLibraryManagerTests(unittest.TestCase):
         def capture(dialog):
             results = dialog.findChild(QListWidget)
             seen.extend(results.item(i).text() for i in range(results.count()))
-            results.setCurrentRow(next(i for i, text in enumerate(seen) if "Audible" in text))
+            results.setCurrentRow(next(i for i, text in enumerate(seen) if "Kobo" in text))
             results.itemActivated.emit(results.currentItem())
             return 0
 
@@ -1740,9 +1715,9 @@ class QtLibraryManagerTests(unittest.TestCase):
         with patch.object(self.window, "selected_row", return_value=self.window.db.get_book(book_id)),                 patch("qt_library_manager.search_gutenberg", return_value=hit),                 patch("qt_library_manager.QDesktopServices.openUrl", side_effect=lambda url: opened.append(url.toString()) or True),                 patch.object(QDialog, "exec", new=capture):
             self.window.find_book_elsewhere()
         self.assertTrue(seen[0].startswith("Project Gutenberg, free download"))
-        for expected in ("Free and accessible services, NLS BARD", "Commercial services, Audible", "Your local library, Hoopla"):
+        for expected in ("Free and accessible services, NLS BARD", "Commercial services, Kobo", "Your local library, Hoopla"):
             self.assertIn(expected, seen)
-        self.assertEqual(opened, ["https://www.audible.com/search?keywords=Pride+and+Prejudice+Austen"])
+        self.assertEqual(opened, ["https://www.kobo.com/us/en/search?query=Pride+and+Prejudice+Austen"])
 
 
 if __name__ == "__main__":
